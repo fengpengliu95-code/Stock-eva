@@ -13,6 +13,7 @@ from backend.app.market.secondary_capability import (
     CapabilityState,
     build_capability_bundle,
     build_capability_evidence,
+    build_tushare_candidate_bundle,
     evaluate_secondary_readiness,
 )
 
@@ -236,3 +237,55 @@ def test_reader_detects_path_replacement_during_read(
     assert replaced is True
     assert result.status == "unavailable"
     assert result.reason_code == "CONTROL_STATE_UNAVAILABLE"
+
+
+def test_tushare_official_candidate_qualifies_only_proven_semantics() -> None:
+    bundle = build_tushare_candidate_bundle(
+        review_id="review-tushare-official-20260918",
+        observed_at=datetime(2026, 9, 18, 8, tzinfo=UTC),
+        daily_document_sha256="a" * 64,
+        adjustment_document_sha256="b" * 64,
+        suspension_document_sha256="c" * 64,
+    )
+
+    states = {item.capability: item.state for item in bundle.evidence}
+    assert states["daily_bar"] == CapabilityState.QUALIFIED
+    assert states["activity_units"] == CapabilityState.QUALIFIED
+    assert states["suspension_semantics"] == CapabilityState.QUALIFIED
+    assert states["adjustment_factor"] == CapabilityState.UNQUALIFIED
+    assert all(
+        states[name] == CapabilityState.UNKNOWN
+        for name in (
+            "exact_session_universe",
+            "required_indexes",
+            "calendar_binding",
+            "quota_account_entitlement",
+            "transport_security",
+            "raw_retention",
+        )
+    )
+
+    readiness = evaluate_secondary_readiness("tushare", bundle.evidence)
+
+    assert readiness.status == "blocked"
+    assert readiness.eligible_for_full_session_qualification is False
+    assert readiness.blocked_reasons[0] == "ADJUSTMENT_FACTOR_UNQUALIFIED"
+    assert readiness.canonical_failover_state == CapabilityState.UNQUALIFIED
+    assert readiness.effective_auto_failover_enabled is False
+    assert readiness.provider_requests == 0
+    assert readiness.writes is False
+
+
+def test_tushare_candidate_rejects_invalid_review_or_document_hash() -> None:
+    values = {
+        "review_id": "review-tushare-official-20260918",
+        "observed_at": datetime(2026, 9, 18, 8, tzinfo=UTC),
+        "daily_document_sha256": "a" * 64,
+        "adjustment_document_sha256": "b" * 64,
+        "suspension_document_sha256": "c" * 64,
+    }
+
+    with pytest.raises(ValidationError):
+        build_tushare_candidate_bundle(**{**values, "daily_document_sha256": "invalid"})
+    with pytest.raises(ValidationError):
+        build_tushare_candidate_bundle(**{**values, "review_id": "token=secret path/name"})

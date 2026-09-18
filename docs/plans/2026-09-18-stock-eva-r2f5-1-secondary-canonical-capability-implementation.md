@@ -30,7 +30,7 @@ open-descriptor identities before/after a bounded read, rejects duplicate JSON m
 the immutable bundle hash. Every failure returns `CONTROL_STATE_UNAVAILABLE`, zero requests and zero
 writes. Production evidence has not been created or read.
 
-## Task 3 — Encode the Tushare candidate contract without enabling it
+## Task 3 — Encode the Tushare candidate contract without enabling it — COMPLETE
 
 Freeze official daily, adjustment-factor and suspension semantics as reviewed evidence references.
 The evaluator may qualify activity units and daily/suspension endpoint semantics only when their
@@ -38,6 +38,12 @@ exact evidence is present. HTTPS data transport, private raw retention, intended
 quota, exact-session universe and factor anchor/direction remain blocking until separately proven.
 
 Gate: a partial Tushare bundle remains ineligible and constructs no client. TickFlow remains unchanged.
+
+The offline builder admits only the reviewed daily-bar fields, activity units and endpoint-level
+suspension behavior. Adjustment-factor anchor/direction/restatement is explicitly `UNQUALIFIED`;
+the remaining unproven controls stay `UNKNOWN`. State-specific reason codes preserve that distinction,
+while canonical failover and effective auto-failover remain disabled. No provider module is imported,
+no client is constructed and no production evidence is written.
 
 ## Task 4 — Build the full-session qualification harness offline
 

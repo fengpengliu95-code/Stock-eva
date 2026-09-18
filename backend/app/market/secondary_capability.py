@@ -36,10 +36,6 @@ CANONICAL_CAPABILITIES = (
     "raw_retention",
 )
 
-_REASON_BY_CAPABILITY = {
-    capability: f"{capability.upper()}_UNKNOWN" for capability in CANONICAL_CAPABILITIES
-}
-
 
 class CapabilityState(StrEnum):
     QUALIFIED = "QUALIFIED"
@@ -74,6 +70,14 @@ def _digest(domain: str, value: object) -> str:
 
 class _Frozen(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+
+class _TushareCandidateInput(_Frozen):
+    review_id: str = Field(pattern=_SAFE_ID.pattern)
+    observed_at: datetime
+    daily_document_sha256: str = Field(pattern=_SHA256.pattern)
+    adjustment_document_sha256: str = Field(pattern=_SHA256.pattern)
+    suspension_document_sha256: str = Field(pattern=_SHA256.pattern)
 
 
 class ReviewedCapabilityEvidenceV1(_Frozen):
@@ -295,6 +299,8 @@ def build_capability_bundle(
     evidence: tuple[ReviewedCapabilityEvidenceV1, ...],
 ) -> ReviewedCapabilityBundleV1:
     by_capability = {item.capability: item for item in evidence}
+    if len(evidence) != len(CANONICAL_CAPABILITIES) or len(by_capability) != len(evidence):
+        raise ValueError("capability bundle is incomplete")
     ordered = tuple(by_capability[name] for name in CANONICAL_CAPABILITIES if name in by_capability)
     values = {
         "schema_version": 1,
@@ -304,6 +310,108 @@ def build_capability_bundle(
     return ReviewedCapabilityBundleV1.model_validate(
         {**values, "bundle_sha256": _digest(BUNDLE_DOMAIN, values)}
     )
+
+
+def build_tushare_candidate_bundle(
+    *,
+    review_id: str,
+    observed_at: datetime,
+    daily_document_sha256: str,
+    adjustment_document_sha256: str,
+    suspension_document_sha256: str,
+) -> ReviewedCapabilityBundleV1:
+    """Build offline evidence for only the semantics proven by reviewed documents."""
+    source = _TushareCandidateInput.model_validate(
+        {
+            "review_id": review_id,
+            "observed_at": observed_at,
+            "daily_document_sha256": daily_document_sha256,
+            "adjustment_document_sha256": adjustment_document_sha256,
+            "suspension_document_sha256": suspension_document_sha256,
+        }
+    )
+    document_set_sha256 = _digest(
+        "stock-eva/r2f5.1/tushare-official-document-set/v1",
+        {
+            "daily": source.daily_document_sha256,
+            "adjustment": source.adjustment_document_sha256,
+            "suspension": source.suspension_document_sha256,
+        },
+    )
+    definitions = {
+        "daily_bar": (
+            CapabilityState.QUALIFIED,
+            source.daily_document_sha256,
+            "unadjusted-daily-ohlcv-fields",
+        ),
+        "activity_units": (
+            CapabilityState.QUALIFIED,
+            source.daily_document_sha256,
+            "volume-lots-and-amount-thousand-cny",
+        ),
+        "adjustment_factor": (
+            CapabilityState.UNQUALIFIED,
+            source.adjustment_document_sha256,
+            "endpoint-does-not-prove-anchor-direction-or-restatement",
+        ),
+        "suspension_semantics": (
+            CapabilityState.QUALIFIED,
+            _digest(
+                "stock-eva/r2f5.1/tushare-suspension-document-set/v1",
+                {
+                    "daily": source.daily_document_sha256,
+                    "suspension": source.suspension_document_sha256,
+                },
+            ),
+            "daily-omits-suspended-symbols-and-suspend-d-is-separate",
+        ),
+        "exact_session_universe": (
+            CapabilityState.UNKNOWN,
+            document_set_sha256,
+            "exact-session-universe-unproven",
+        ),
+        "required_indexes": (
+            CapabilityState.UNKNOWN,
+            document_set_sha256,
+            "required-index-set-unproven",
+        ),
+        "calendar_binding": (
+            CapabilityState.UNKNOWN,
+            document_set_sha256,
+            "canonical-calendar-binding-unproven",
+        ),
+        "quota_account_entitlement": (
+            CapabilityState.UNKNOWN,
+            document_set_sha256,
+            "intended-account-entitlement-and-quota-unproven",
+        ),
+        "transport_security": (
+            CapabilityState.UNKNOWN,
+            document_set_sha256,
+            "data-api-transport-security-unproven",
+        ),
+        "raw_retention": (
+            CapabilityState.UNKNOWN,
+            document_set_sha256,
+            "private-raw-retention-contract-unproven",
+        ),
+    }
+    evidence = tuple(
+        build_capability_evidence(
+            provider_id="tushare",
+            capability=capability,
+            review_id=source.review_id,
+            observed_at=source.observed_at,
+            official_document_sha256=definitions[capability][1],
+            contract_sha256=_digest(
+                "stock-eva/r2f5.1/tushare-capability-contract/v1",
+                {"capability": capability, "contract": definitions[capability][2]},
+            ),
+            state=definitions[capability][0],
+        )
+        for capability in CANONICAL_CAPABILITIES
+    )
+    return build_capability_bundle(provider_id="tushare", evidence=evidence)
 
 
 def evaluate_secondary_readiness(
@@ -340,7 +448,7 @@ def evaluate_secondary_readiness(
             eligible = False
         else:
             reasons = tuple(
-                _REASON_BY_CAPABILITY[item.capability]
+                f"{item.capability.upper()}_{item.state.value}"
                 for item in ordered
                 if item.state is not CapabilityState.QUALIFIED
             ) + ("FULL_SESSION_QUALIFICATION_UNQUALIFIED",)
@@ -374,5 +482,6 @@ __all__ = [
     "SecondaryCanonicalReadinessV1",
     "build_capability_bundle",
     "build_capability_evidence",
+    "build_tushare_candidate_bundle",
     "evaluate_secondary_readiness",
 ]
