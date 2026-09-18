@@ -297,6 +297,14 @@ def _frame_with_crc_trailer(body: bytes, *, corrupt: bool = False) -> bytes:
     return header + body + b"\1" + str(crc).encode() + PROTOCOL_MARKER
 
 
+def _compressed_frame_with_decimal_trailer(body: bytes) -> bytes:
+    import baostock.data.messageheader as messageheader
+
+    compressed = zlib.compress(body)
+    header = messageheader.to_message_header("99", len(compressed)).encode()
+    return header + compressed + b"\1" + b"1234567890" + b"\n" + PROTOCOL_MARKER
+
+
 class FramedSocket:
     def __init__(
         self,
@@ -500,6 +508,18 @@ def test_checked_send_validates_noncompressed_length_as_unicode_characters() -> 
     assert result == response[:21].decode("ascii") + body + "\n"
     assert observations[0].recv_calls == 2
     assert observations[0].response_bytes == len(response)
+
+
+def test_checked_send_accepts_exact_compressed_decimal_trailer_envelope() -> None:
+    body = b"0\1ok\n"
+    response = _compressed_frame_with_decimal_trailer(body)
+
+    result, error, observations = _invoke_checked_send(FramedSocket([response]))
+
+    assert error is None
+    assert result == response[:21].decode("ascii") + body.decode("utf-8")
+    assert observations[0].response_bytes == len(response)
+    assert observations[0].end_marker_seen is True
 
 
 def test_checked_send_rejects_corrupt_crc_trailer() -> None:

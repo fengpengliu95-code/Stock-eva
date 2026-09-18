@@ -27,7 +27,7 @@ from backend.app.market.provider_transport import (
 EXPECTED_BAOSTOCK_VERSION = "0.9.3"
 EXPECTED_SOCKETUTIL_SHA256 = "248591168ad087fb9c91b64e8c909608082528ecbecf25541dcbce0fe9cfcd25"
 PROTOCOL_MARKER = b"<![CDATA[]]>\n"
-MAX_CRC_TRAILER_BYTES = 11
+MAX_PROVIDER_TRAILER_BYTES = 12
 MAX_RESPONSE_BYTES = 64 * 1024 * 1024
 MAX_RECV_CALLS = 16_384
 
@@ -392,7 +392,7 @@ def checked_send_msg(message: str) -> str:
             if body_length > (
                 MAX_RESPONSE_BYTES
                 - constants.MESSAGE_HEADER_LENGTH
-                - MAX_CRC_TRAILER_BYTES
+                - MAX_PROVIDER_TRAILER_BYTES
                 - len(PROTOCOL_MARKER)
             ):
                 _raise_transport_error(
@@ -411,6 +411,16 @@ def checked_send_msg(message: str) -> str:
         if message_type in constants.COMPRESSED_MESSAGE_TYPE_TUPLE:
             if body_length in {len(wire_body), len(wire_body) + len(PROTOCOL_MARKER)}:
                 raw_body = wire_body
+            else:
+                declared_body = wire_body[:body_length]
+                provider_trailer = wire_body[body_length:]
+                if (
+                    provider_trailer.startswith(b"\1")
+                    and provider_trailer.endswith(b"\n")
+                    and provider_trailer[1:-1].isdigit()
+                    and 1 <= len(provider_trailer[1:-1]) <= 10
+                ):
+                    raw_body = declared_body
         else:
             try:
                 decoded_wire_body = wire_body.decode("utf-8")
