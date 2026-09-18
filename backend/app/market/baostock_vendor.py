@@ -406,43 +406,41 @@ def checked_send_msg(message: str) -> str:
                 )
 
         if not end_marker_seen:
-            body_end = constants.MESSAGE_HEADER_LENGTH + body_length
-            trailer_prefix = bytes(received[body_end:])
-            trailer_is_possible = not trailer_prefix or PROTOCOL_MARKER.startswith(trailer_prefix)
-            if (
-                not trailer_is_possible
-                and message_type not in constants.COMPRESSED_MESSAGE_TYPE_TUPLE
-            ):
-                declared_body = bytes(received[constants.MESSAGE_HEADER_LENGTH : body_end])
-                expected_crc_trailer = b"\1" + str(
-                    zlib.crc32(bytes(received[: constants.MESSAGE_HEADER_LENGTH]) + declared_body)
-                ).encode("ascii")
-                trailer_is_possible = expected_crc_trailer.startswith(trailer_prefix) or (
-                    trailer_prefix.startswith(expected_crc_trailer)
-                    and PROTOCOL_MARKER.startswith(trailer_prefix[len(expected_crc_trailer) :])
-                )
-            if not trailer_is_possible:
-                _raise_transport_error(
-                    "BaoStock transport response marker is invalid",
-                    started_at=started_at,
-                    normalized_error=NormalizedTransportError.PROTOCOL_ERROR,
-                    protocol_stage=ProtocolStage.FRAME,
-                    recv_calls=recv_calls,
-                    response_bytes=len(received),
-                    end_marker_seen=False,
-                )
             continue
         wire_body = bytes(received[constants.MESSAGE_HEADER_LENGTH : -len(PROTOCOL_MARKER)])
-        if body_length in {len(wire_body), len(wire_body) + len(PROTOCOL_MARKER)}:
-            raw_body = wire_body
-        elif message_type not in constants.COMPRESSED_MESSAGE_TYPE_TUPLE:
-            declared_body = wire_body[:body_length]
-            crc_trailer = wire_body[body_length:]
-            expected_crc = zlib.crc32(
-                bytes(received[: constants.MESSAGE_HEADER_LENGTH]) + declared_body
-            )
-            if crc_trailer == b"\1" + str(expected_crc).encode("ascii"):
-                raw_body = declared_body
+        if message_type in constants.COMPRESSED_MESSAGE_TYPE_TUPLE:
+            if body_length in {len(wire_body), len(wire_body) + len(PROTOCOL_MARKER)}:
+                raw_body = wire_body
+        else:
+            try:
+                decoded_wire_body = wire_body.decode("utf-8")
+            except UnicodeDecodeError:
+                decoded_wire_body = None
+            if decoded_wire_body is not None and body_length in {
+                len(decoded_wire_body),
+                len(decoded_wire_body) + len(PROTOCOL_MARKER.decode("ascii")),
+            }:
+                raw_body = wire_body
+            else:
+                declared_body, separator, crc_digits = wire_body.rpartition(b"\1")
+                if separator and crc_digits.isdigit() and len(crc_digits) <= 10:
+                    expected_crc = zlib.crc32(
+                        bytes(received[: constants.MESSAGE_HEADER_LENGTH]) + declared_body
+                    )
+                    try:
+                        decoded_declared_body = declared_body.decode("utf-8")
+                    except UnicodeDecodeError:
+                        decoded_declared_body = None
+                    if (
+                        crc_digits == str(expected_crc).encode("ascii")
+                        and decoded_declared_body is not None
+                        and body_length
+                        in {
+                            len(decoded_declared_body),
+                            len(decoded_declared_body) + len(PROTOCOL_MARKER.decode("ascii")),
+                        }
+                    ):
+                        raw_body = declared_body
         if raw_body is None:
             _raise_transport_error(
                 "BaoStock transport response frame length is invalid",

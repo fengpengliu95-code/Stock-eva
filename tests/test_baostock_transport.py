@@ -269,6 +269,13 @@ def _frame(body: bytes, *, message_type: str = "34") -> bytes:
     return header + body + PROTOCOL_MARKER
 
 
+def _unicode_frame(body: str, *, message_type: str = "36") -> bytes:
+    import baostock.data.messageheader as messageheader
+
+    header = messageheader.to_message_header(message_type, len(body)).encode()
+    return header + body.encode("utf-8") + PROTOCOL_MARKER
+
+
 def _sdk_noncompressed_response(response: bytes, body: bytes) -> str:
     return response[:21].decode("ascii") + body.decode("utf-8") + "\n"
 
@@ -480,6 +487,19 @@ def test_checked_send_waits_for_fragmented_marker_after_crc_trailer() -> None:
     assert observations[0].recv_calls == 2
     assert observations[0].response_bytes == len(response)
     assert observations[0].end_marker_seen is True
+
+
+def test_checked_send_validates_noncompressed_length_as_unicode_characters() -> None:
+    body = "0\1ok\1浦发银行"
+    response = _unicode_frame(body)
+    connection = FramedSocket([response[:-8], response[-8:]])
+
+    result, error, observations = _invoke_checked_send(connection)
+
+    assert error is None
+    assert result == response[:21].decode("ascii") + body + "\n"
+    assert observations[0].recv_calls == 2
+    assert observations[0].response_bytes == len(response)
 
 
 def test_checked_send_rejects_corrupt_crc_trailer() -> None:
@@ -701,9 +721,9 @@ def test_checked_send_converts_send_error_without_reading() -> None:
         ),
         (
             [_frame(b"0\1ok")[: -len(PROTOCOL_MARKER)] + b"invalid-marker"],
-            NormalizedTransportError.PROTOCOL_ERROR,
-            ProtocolStage.FRAME,
-            1,
+            NormalizedTransportError.EOF,
+            ProtocolStage.RECEIVE,
+            2,
             len(_frame(b"0\1ok")[: -len(PROTOCOL_MARKER)] + b"invalid-marker"),
             False,
         ),
