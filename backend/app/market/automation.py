@@ -2672,6 +2672,7 @@ class MarketAutomationService:
             published_as_of=published.requested_date if published else None,
             state=current,
         )
+        current = self._reconcile_current_publication(decision, current, published)
         _log_event(
             logging.INFO,
             "market_refresh_decision",
@@ -2758,6 +2759,37 @@ class MarketAutomationService:
         finally:
             self._last_canonical_execution = None
         return outcome
+
+    def _reconcile_current_publication(
+        self,
+        decision: ScheduleDecision,
+        current: SchedulerState | None,
+        published: RefreshResult | None,
+    ) -> SchedulerState | None:
+        if (
+            decision.action != "none"
+            or decision.refresh_state != "success"
+            or decision.target_session is None
+            or published is None
+            or published.status != "ready"
+            or published.requested_date is None
+            or published.requested_date < decision.target_session
+        ):
+            return current
+        same_target = current is not None and current.target_session == decision.target_session
+        state = SchedulerState(
+            target_session=decision.target_session,
+            refresh_state="success",
+            attempt_count=current.attempt_count if same_target else 0,
+            last_attempt_at=current.last_attempt_at if same_target else None,
+            last_success_at=published.completed_at,
+            next_retry_at=None,
+            calendar_status="confirmed",
+            error_code=None,
+        )
+        if state != current:
+            self.store.save_scheduler_state(state)
+        return state
 
     def _plan_continuity(
         self,

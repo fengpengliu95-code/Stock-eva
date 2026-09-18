@@ -541,6 +541,46 @@ def test_automation_optional_continuity_hook_is_planning_only_and_never_consumes
     assert store.repair_queue_snapshot().status == "unavailable"
 
 
+def test_automation_reconciles_stale_failure_state_when_canonical_is_current(
+    tmp_path: Path,
+) -> None:
+    module = load_module("backend.app.market.automation")
+    target = date(2026, 7, 24)
+    store = MarketStore(tmp_path / "market.duckdb")
+    save_published(store, target)
+    stale = module.SchedulerState(
+        target_session=target,
+        refresh_state="error",
+        attempt_count=1,
+        last_attempt_at=datetime(2026, 7, 24, 18, 10, tzinfo=SHANGHAI),
+        last_success_at=datetime(2026, 7, 23, 18, 20, tzinfo=SHANGHAI),
+        calendar_status="unavailable",
+        error_code="schema",
+    )
+    store.save_scheduler_state(stale)
+    provider = CompleteProvider(fixture_bars(target))
+    service = module.MarketAutomationService(
+        store,
+        provider,
+        synthetic_calendar(),
+        required_symbols=lambda: {"sh.600000"},
+    )
+
+    outcome = service.run_due_once(datetime(2026, 7, 24, 18, 20, tzinfo=SHANGHAI))
+
+    assert outcome.decision.action == "none"
+    assert outcome.decision.refresh_state == "success"
+    assert outcome.state.refresh_state == "success"
+    assert outcome.state.calendar_status == "confirmed"
+    assert outcome.state.error_code is None
+    assert outcome.state.next_retry_at is None
+    assert outcome.state.attempt_count == 1
+    assert outcome.state.last_attempt_at == stale.last_attempt_at
+    assert outcome.state.last_success_at == datetime(2026, 7, 23, 10, 1, tzinfo=UTC)
+    assert store.scheduler_state() == outcome.state
+    assert provider.fetch_calls == provider.calendar_calls == 0
+
+
 def test_automation_run_pins_calendar_for_initial_and_revalidation_decisions(
     tmp_path: Path,
 ) -> None:
