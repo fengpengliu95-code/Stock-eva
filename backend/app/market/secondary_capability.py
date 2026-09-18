@@ -4,9 +4,12 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
+import stat
 from datetime import datetime
 from enum import StrEnum
+from pathlib import Path
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -16,6 +19,9 @@ _SAFE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 
 EVIDENCE_DOMAIN = "stock-eva/r2f5.1/secondary-capability-evidence/v1"
 READINESS_DOMAIN = "stock-eva/r2f5.1/secondary-canonical-readiness/v1"
+BUNDLE_DOMAIN = "stock-eva/r2f5.1/secondary-capability-bundle/v1"
+_DEFAULT_MAX_BUNDLE_BYTES = 128 * 1024
+_READ_CHUNK_BYTES = 64 * 1024
 
 CANONICAL_CAPABILITIES = (
     "daily_bar",
@@ -100,6 +106,140 @@ class ReviewedCapabilityEvidenceV1(_Frozen):
         return self
 
 
+class ReviewedCapabilityBundleV1(_Frozen):
+    schema_version: Literal[1] = 1
+    provider_id: Literal["tickflow", "tushare"]
+    evidence: tuple[ReviewedCapabilityEvidenceV1, ...]
+    bundle_sha256: str = Field(pattern=_SHA256.pattern)
+
+    @model_validator(mode="after")
+    def validate_bundle(self) -> ReviewedCapabilityBundleV1:
+        capabilities = tuple(item.capability for item in self.evidence)
+        if (
+            any(item.provider_id != self.provider_id for item in self.evidence)
+            or len(capabilities) != len(CANONICAL_CAPABILITIES)
+            or len(set(capabilities)) != len(CANONICAL_CAPABILITIES)
+            or set(capabilities) != set(CANONICAL_CAPABILITIES)
+        ):
+            raise ValueError("capability bundle is incomplete")
+        values = self.model_dump(mode="json", exclude={"bundle_sha256"})
+        if self.bundle_sha256 != _digest(BUNDLE_DOMAIN, values):
+            raise ValueError("capability bundle digest mismatch")
+        return self
+
+
+class CapabilityEvidenceReadResult(_Frozen):
+    status: Literal["ready", "unavailable"]
+    reason_code: Literal["CONTROL_STATE_UNAVAILABLE"] | None = None
+    bundle: ReviewedCapabilityBundleV1 | None = None
+    provider_requests: Literal[0] = 0
+    writes: Literal[False] = False
+
+    @model_validator(mode="after")
+    def validate_result(self) -> CapabilityEvidenceReadResult:
+        ready = self.status == "ready"
+        if ready != (self.bundle is not None) or ready != (self.reason_code is None):
+            raise ValueError("capability evidence read result is inconsistent")
+        return self
+
+
+def _duplicate_rejecting_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate JSON member")
+        result[key] = value
+    return result
+
+
+class CapabilityEvidenceReader:
+    def __init__(self, path: Path, *, max_bytes: int = _DEFAULT_MAX_BUNDLE_BYTES) -> None:
+        self.path = Path(path)
+        self.max_bytes = max_bytes
+
+    @staticmethod
+    def _unavailable() -> CapabilityEvidenceReadResult:
+        return CapabilityEvidenceReadResult(
+            status="unavailable",
+            reason_code="CONTROL_STATE_UNAVAILABLE",
+        )
+
+    @staticmethod
+    def _identity(value: os.stat_result) -> tuple[int, int, int, int, int]:
+        return (
+            value.st_dev,
+            value.st_ino,
+            value.st_size,
+            value.st_mtime_ns,
+            value.st_ctime_ns,
+        )
+
+    def _parents_are_directories(self) -> bool:
+        current = Path(self.path.anchor)
+        for component in self.path.parts[1:-1]:
+            current /= component
+            value = os.stat(current, follow_symlinks=False)
+            if not stat.S_ISDIR(value.st_mode):
+                return False
+        return True
+
+    def read(self) -> CapabilityEvidenceReadResult:
+        descriptor = -1
+        try:
+            if (
+                not self.path.is_absolute()
+                or self.path == Path(self.path.anchor)
+                or ".." in self.path.parts
+                or type(self.max_bytes) is not int
+                or self.max_bytes < 1
+                or not self._parents_are_directories()
+            ):
+                return self._unavailable()
+            nofollow = getattr(os, "O_NOFOLLOW", 0)
+            if not nofollow:
+                return self._unavailable()
+            entry_before = os.stat(self.path, follow_symlinks=False)
+            if not stat.S_ISREG(entry_before.st_mode):
+                return self._unavailable()
+            descriptor = os.open(self.path, os.O_RDONLY | os.O_CLOEXEC | nofollow)
+            opened_before = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(opened_before.st_mode)
+                or self._identity(entry_before) != self._identity(opened_before)
+                or opened_before.st_size < 1
+                or opened_before.st_size > self.max_bytes
+            ):
+                return self._unavailable()
+            payload = bytearray()
+            while True:
+                chunk = os.read(
+                    descriptor,
+                    min(_READ_CHUNK_BYTES, self.max_bytes + 1 - len(payload)),
+                )
+                if not chunk:
+                    break
+                payload.extend(chunk)
+                if len(payload) > self.max_bytes:
+                    return self._unavailable()
+            opened_after = os.fstat(descriptor)
+            entry_after = os.stat(self.path, follow_symlinks=False)
+            if self._identity(opened_before) != self._identity(opened_after) or self._identity(
+                opened_after
+            ) != self._identity(entry_after):
+                return self._unavailable()
+            decoded = bytes(payload).decode("utf-8")
+            parsed = json.loads(decoded, object_pairs_hook=_duplicate_rejecting_object)
+            if not isinstance(parsed, dict):
+                return self._unavailable()
+            bundle = ReviewedCapabilityBundleV1.model_validate_json(payload)
+            return CapabilityEvidenceReadResult(status="ready", bundle=bundle)
+        except (OSError, UnicodeError, ValueError):
+            return self._unavailable()
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+
+
 class SecondaryCanonicalReadinessV1(_Frozen):
     schema_version: Literal[1] = 1
     status: Literal["ready", "blocked", "unavailable"]
@@ -146,6 +286,23 @@ def build_capability_evidence(
     }
     return ReviewedCapabilityEvidenceV1.model_validate(
         {**values, "evidence_sha256": _digest(EVIDENCE_DOMAIN, values)}
+    )
+
+
+def build_capability_bundle(
+    *,
+    provider_id: Literal["tickflow", "tushare"],
+    evidence: tuple[ReviewedCapabilityEvidenceV1, ...],
+) -> ReviewedCapabilityBundleV1:
+    by_capability = {item.capability: item for item in evidence}
+    ordered = tuple(by_capability[name] for name in CANONICAL_CAPABILITIES if name in by_capability)
+    values = {
+        "schema_version": 1,
+        "provider_id": provider_id,
+        "evidence": ordered,
+    }
+    return ReviewedCapabilityBundleV1.model_validate(
+        {**values, "bundle_sha256": _digest(BUNDLE_DOMAIN, values)}
     )
 
 
@@ -209,9 +366,13 @@ def evaluate_secondary_readiness(
 
 __all__ = [
     "CANONICAL_CAPABILITIES",
+    "CapabilityEvidenceReadResult",
+    "CapabilityEvidenceReader",
     "CapabilityState",
     "ReviewedCapabilityEvidenceV1",
+    "ReviewedCapabilityBundleV1",
     "SecondaryCanonicalReadinessV1",
+    "build_capability_bundle",
     "build_capability_evidence",
     "evaluate_secondary_readiness",
 ]

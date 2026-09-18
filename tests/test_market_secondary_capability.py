@@ -1,11 +1,17 @@
+import hashlib
+import json
+import os
 from datetime import UTC, datetime
+from pathlib import Path
 
 import pytest
 from pydantic import ValidationError
 
 from backend.app.market.secondary_capability import (
     CANONICAL_CAPABILITIES,
+    CapabilityEvidenceReader,
     CapabilityState,
+    build_capability_bundle,
     build_capability_evidence,
     evaluate_secondary_readiness,
 )
@@ -108,3 +114,125 @@ def test_capability_hash_and_closed_models_reject_tampering() -> None:
         )
     with pytest.raises(ValidationError):
         type(evidence).model_validate({**evidence.model_dump(mode="python"), "token": "secret"})
+
+
+def _bundle(provider: str = "tushare"):
+    return build_capability_bundle(
+        provider_id=provider,
+        evidence=tuple(
+            _evidence(provider, capability, CapabilityState.QUALIFIED)
+            for capability in CANONICAL_CAPABILITIES
+        ),
+    )
+
+
+def _write_bundle(path: Path, bundle=None) -> None:
+    value = bundle or _bundle()
+    path.write_text(json.dumps(value.model_dump(mode="json")), encoding="utf-8")
+
+
+def _fingerprint(path: Path) -> tuple[int, int, int, int, str]:
+    value = path.stat(follow_symlinks=False)
+    return (
+        value.st_dev,
+        value.st_ino,
+        value.st_size,
+        value.st_mtime_ns,
+        hashlib.sha256(path.read_bytes()).hexdigest(),
+    )
+
+
+def test_reader_returns_strict_bundle_without_modifying_input(tmp_path: Path) -> None:
+    path = tmp_path / "capabilities.json"
+    _write_bundle(path)
+    before = _fingerprint(path)
+
+    result = CapabilityEvidenceReader(path).read()
+
+    assert result.status == "ready"
+    assert result.reason_code is None
+    assert result.bundle == _bundle()
+    assert result.provider_requests == 0
+    assert result.writes is False
+    assert _fingerprint(path) == before
+
+
+@pytest.mark.parametrize(
+    "failure", ["missing", "relative", "symlink", "symlink_parent", "oversized"]
+)
+def test_reader_rejects_unsafe_or_unbounded_input(tmp_path: Path, failure: str) -> None:
+    path = tmp_path / "capabilities.json"
+    _write_bundle(path)
+    if failure == "missing":
+        target = tmp_path / "missing.json"
+    elif failure == "relative":
+        target = Path("capabilities.json")
+    elif failure == "symlink":
+        target = tmp_path / "alias.json"
+        target.symlink_to(path)
+    elif failure == "symlink_parent":
+        alias = tmp_path / "alias-parent"
+        alias.symlink_to(tmp_path, target_is_directory=True)
+        target = alias / path.name
+    else:
+        target = path
+    before = _fingerprint(path)
+
+    result = CapabilityEvidenceReader(
+        target,
+        max_bytes=path.stat().st_size - 1 if failure == "oversized" else 128 * 1024,
+    ).read()
+
+    assert result.status == "unavailable"
+    assert result.reason_code == "CONTROL_STATE_UNAVAILABLE"
+    assert result.bundle is None
+    assert result.provider_requests == 0
+    assert result.writes is False
+    assert _fingerprint(path) == before
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        '{"schema_version":1,"schema_version":1}',
+        '{"schema_version":1',
+        '{"schema_version":1,"provider_id":"unknown"}',
+    ],
+)
+def test_reader_rejects_duplicate_truncated_or_unknown_json(tmp_path: Path, payload: str) -> None:
+    path = tmp_path / "capabilities.json"
+    path.write_text(payload, encoding="utf-8")
+    before = _fingerprint(path)
+
+    result = CapabilityEvidenceReader(path).read()
+
+    assert result.status == "unavailable"
+    assert result.reason_code == "CONTROL_STATE_UNAVAILABLE"
+    assert _fingerprint(path) == before
+
+
+def test_reader_detects_path_replacement_during_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "capabilities.json"
+    replacement = tmp_path / "replacement.json"
+    _write_bundle(path)
+    _write_bundle(replacement, _bundle("tickflow"))
+    real_read = os.read
+    replaced = False
+
+    def replacing_read(descriptor: int, size: int) -> bytes:
+        nonlocal replaced
+        data = real_read(descriptor, size)
+        if data and not replaced:
+            replaced = True
+            os.replace(replacement, path)
+        return data
+
+    monkeypatch.setattr("backend.app.market.secondary_capability.os.read", replacing_read)
+
+    result = CapabilityEvidenceReader(path).read()
+
+    assert replaced is True
+    assert result.status == "unavailable"
+    assert result.reason_code == "CONTROL_STATE_UNAVAILABLE"

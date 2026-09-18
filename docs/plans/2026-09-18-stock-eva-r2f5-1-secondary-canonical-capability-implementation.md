@@ -4,7 +4,7 @@
 
 **Design:** `2026-09-18-stock-eva-r2f5-1-secondary-canonical-capability-design.md`
 
-## Task 1 — Freeze the evidence and readiness models
+## Task 1 — Freeze the evidence and readiness models — COMPLETE
 
 Create `backend/app/market/secondary_capability.py` and
 `tests/test_market_secondary_capability.py`. Begin with RED tests for strict hashes, capability
@@ -13,7 +13,10 @@ only immutable v1 models and a pure evaluator. No store, CLI, API or provider im
 
 Gate: focused tests, Ruff, format and diff checks; independent design/quality review.
 
-## Task 2 — Add a descriptor-safe reviewed-evidence reader
+Implemented at `6ceb8cc6432d94dd4511edabe0ea97b26ff326cf`; focused compatibility and static
+checks passed. Version-level independent review remains pending.
+
+## Task 2 — Add a descriptor-safe reviewed-evidence reader — COMPLETE
 
 Add an offline reader for an explicitly supplied reviewed capability bundle. Require regular files,
 no symlinks, bounded bytes, strict JSON, canonical hash and a closed capability vocabulary. Missing,
@@ -21,6 +24,11 @@ changed or conflicting evidence returns `CONTROL_STATE_UNAVAILABLE`; it never in
 
 Gate: replacement, truncation, oversized, duplicate, unknown-capability and changed-during-read RED/
 GREEN tests. Fingerprint input before/after every test.
+
+The reader is absolute-path-only, rejects symlinked file or parent components, binds pathname and
+open-descriptor identities before/after a bounded read, rejects duplicate JSON members and validates
+the immutable bundle hash. Every failure returns `CONTROL_STATE_UNAVAILABLE`, zero requests and zero
+writes. Production evidence has not been created or read.
 
 ## Task 3 — Encode the Tushare candidate contract without enabling it
 
@@ -52,4 +60,3 @@ after full-suite verification. Refresh LaunchAgent remains disabled during accep
 Real authenticated provider access begins only after HTTPS transport, retention terms, intended
 account capability and quota are reviewed. A successful canary still cannot publish. Canonical
 failover requires a subsequent 20-session whole-session qualification and manual failover drill.
-
