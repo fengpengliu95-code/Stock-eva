@@ -1538,8 +1538,11 @@ def test_bundled_calendar_supports_cross_year_strategy_history() -> None:
     assert calendar.session_status(date(2025, 1, 2)) == "open"
     assert calendar.session_status(date(2025, 10, 8)) == "closed"
     assert calendar.previous_session(date(2026, 1, 5)) == date(2025, 12, 31)
-    assert calendar.latest_expected_session(datetime(2026, 1, 5, 18, 9, tzinfo=SHANGHAI)) == date(
+    assert calendar.latest_expected_session(datetime(2026, 1, 5, 15, 59, tzinfo=SHANGHAI)) == date(
         2025, 12, 31
+    )
+    assert calendar.latest_expected_session(datetime(2026, 1, 5, 16, 0, tzinfo=SHANGHAI)) == date(
+        2026, 1, 5
     )
 
     current = date(2025, 1, 1)
