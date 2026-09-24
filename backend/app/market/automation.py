@@ -49,6 +49,7 @@ from backend.app.market.evidence import (
 )
 from backend.app.market.failures import (
     MarketFailure,
+    MarketFailureError,
     legacy_failure_quality_issues,
     market_failure_from_exception,
     public_failure_message,
@@ -288,7 +289,13 @@ def inspect_legacy_main_board_input(adapter: object, trade_date: date) -> MainBo
     inspection = adapter.inspect_main_board(trade_date)
     symbols = tuple(sorted(set(inspection.main_board_symbols)))
     if not symbols:
-        raise ProviderHealthError("canonical universe inspection is empty")
+        raise MarketFailureError(
+            MarketFailure(
+                failure_stage="validate",
+                failure_class="universe",
+                retryable=True,
+            )
+        )
     shanghai = sum(symbol.startswith("sh.") for symbol in symbols)
     return MainBoardInspection(
         trade_date=trade_date,
@@ -1614,7 +1621,13 @@ def build_canonical_raw_request(
         raise ProviderHealthError("canonical universe inspection date mismatch")
     main_symbols = tuple(sorted(set(inspection.main_board_symbols)))
     if not main_symbols:
-        raise ProviderHealthError("canonical universe inspection is empty")
+        raise MarketFailureError(
+            MarketFailure(
+                failure_stage="validate",
+                failure_class="universe",
+                retryable=True,
+            )
+        )
     if not set(required_symbols).issubset(main_symbols):
         raise ProviderHealthError("required symbols are outside canonical universe")
     session_symbols = tuple(sorted(set(main_symbols) | set(INDEX_SYMBOLS)))

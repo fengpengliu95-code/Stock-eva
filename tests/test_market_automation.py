@@ -482,6 +482,26 @@ def test_task8_canonical_plan_has_fixed_capacity_without_adjust_factor_shards(sy
     )
 
 
+def test_empty_canonical_universe_is_retryable_and_fail_closed() -> None:
+    adapter = SimpleNamespace(
+        inspect_main_board=lambda _trade_date: SimpleNamespace(main_board_symbols=())
+    )
+
+    with pytest.raises(MarketFailureError) as captured:
+        build_canonical_raw_request(
+            adapter,
+            trade_date=date(2026, 9, 24),
+            refresh_id="empty-universe",
+            required_symbols=set(),
+        )
+
+    assert captured.value.failure == MarketFailure(
+        failure_stage="validate",
+        failure_class="universe",
+        retryable=True,
+    )
+
+
 def test_automation_optional_continuity_dependency_preserves_legacy_behavior_exactly(
     tmp_path: Path,
 ) -> None:

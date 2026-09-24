@@ -26,6 +26,9 @@ endpoint prevents all daily-bar endpoints from being attempted.
   immutable Parquet, SHA-256, manifest, and atomic publication contracts.
 - A failed or incomplete market-data endpoint still invalidates the entire
   candidate. No partial or symbol-level mixed publication is introduced.
+- A protocol-success response with an empty current-session universe is a
+  fail-closed `validate/universe` failure. It is retryable at the existing
+  bounded recovery slots, rather than being mislabeled as an internal error.
 - Later bounded LaunchAgent slots remain available for circuit-aware recovery
   when data are not yet available at 16:00.
 
