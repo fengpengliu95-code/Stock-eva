@@ -77,6 +77,15 @@ before invoking the injected provider. A blocked or mismatched readiness returns
 zero provider requests. The path-based readiness projection is descriptor-safe, read-only and keeps
 canonical/automatic failover disabled. Production installation remains pending the final review gate.
 
+## Task 6 — Preserve disabled refresh during deployment — IMPLEMENTED / INSTALL PENDING
+
+The deployment contract is defined in
+`2026-09-24-stock-eva-r2f5-1-preserve-refresh-deployment-design.md`. An upgrade with an existing
+but unloaded refresh LaunchAgent installs the new plist without bootstrapping it and emits
+`refresh state: preserved unloaded`. Loaded refresh and first-install behavior remain unchanged;
+rollback continues to restore the exact prior loaded set. Controlled installation and runtime
+readback remain pending the exact-commit full-suite gate.
+
 ## Deferred authorization gates
 
 Real authenticated provider access begins only after HTTPS transport, retention terms, intended

@@ -192,7 +192,6 @@ for label in "${LABELS[@]}"; do
     exit 1
   fi
 done
-
 PREVIOUS_ROOT="$TEMP_ROOT/previous"
 /bin/mkdir -p "$PREVIOUS_ROOT"
 for label in "${LABELS[@]}"; do
@@ -205,6 +204,11 @@ for label in "${LABELS[@]}"; do
     /usr/bin/touch "$PREVIOUS_ROOT/loaded.$label"
   fi
 done
+PRESERVE_REFRESH_UNLOADED=0
+if [[ -f "$PREVIOUS_ROOT/existed.com.finlay.stock-eva.refresh" \
+  && ! -f "$PREVIOUS_ROOT/loaded.com.finlay.stock-eva.refresh" ]]; then
+  PRESERVE_REFRESH_UNLOADED=1
+fi
 
 port_is_listening() {
   "$LSOF" -nP -iTCP:"$1" -sTCP:LISTEN >/dev/null 2>&1
@@ -598,6 +602,10 @@ for label in "${LABELS[@]}"; do
     "$LAUNCH_AGENT_ROOT/$label.plist"
 done
 for label in "${LABELS[@]}"; do
+  if [[ "$label" == "com.finlay.stock-eva.refresh" \
+    && "$PRESERVE_REFRESH_UNLOADED" == "1" ]]; then
+    continue
+  fi
   "$LAUNCHCTL" bootstrap \
     "$DOMAIN" \
     "$LAUNCH_AGENT_ROOT/$label.plist"
@@ -623,6 +631,9 @@ for release in "$RELEASES_ROOT"/*; do
 done
 trap - ERR
 echo "installed: 5 Stock EVA LaunchAgents"
+if [[ "$PRESERVE_REFRESH_UNLOADED" == "1" ]]; then
+  echo "refresh state: preserved unloaded"
+fi
 echo "runtime: $RUNTIME_CURRENT"
 echo "release: $RELEASE_ID"
 echo "config: $CONFIG_ROOT"

@@ -1115,6 +1115,35 @@ def test_installer_stops_web_and_releases_8080_before_current_handoff(
     assert events.count(f"launchctl|bootstrap|{backup}|{new_target}") == 1
 
 
+def test_installer_preserves_existing_unloaded_refresh_state(tmp_path: Path) -> None:
+    project = synthetic_project(tmp_path)
+    environment = stateful_install_environment(tmp_path)
+    first = run_installer(project, environment)
+    assert first.returncode == 0, first.stderr
+    state = Path(environment["LAUNCHCTL_STATE"])
+    refresh = "com.finlay.stock-eva.refresh"
+    state.write_text(
+        "\n".join(label for label in state.read_text().splitlines() if label != refresh) + "\n"
+    )
+    event_log = Path(environment["HANDOFF_EVENT_LOG"])
+    event_log.write_text("")
+
+    (project / "uv.lock").write_text("synthetic lock preserve disabled refresh")
+    second = run_installer(project, environment)
+
+    assert second.returncode == 0, second.stderr
+    assert refresh not in state.read_text().splitlines()
+    assert "refresh state: preserved unloaded" in second.stdout
+    events = event_log.read_text().splitlines()
+    assert not any(
+        event.startswith(f"launchctl|bootout|{refresh}|")
+        or event.startswith(f"launchctl|bootstrap|{refresh}|")
+        for event in events
+    )
+    installed = Path(environment["HOME"]) / "Library/LaunchAgents" / f"{refresh}.plist"
+    assert installed.is_file()
+
+
 def test_installer_web_handoff_failure_restores_old_release_and_agents(
     tmp_path: Path,
 ) -> None:
