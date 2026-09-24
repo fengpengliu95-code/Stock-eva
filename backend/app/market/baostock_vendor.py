@@ -77,7 +77,15 @@ def _market_failure(normalized_error: NormalizedTransportError) -> MarketFailure
 
 @contextmanager
 def transport_observation_sink(sink: ObservationSink) -> Iterator[None]:
-    token = _observation_sink.set(sink)
+    previous = _observation_sink.get()
+
+    def fan_out(observation: TransportObservation) -> None:
+        assert previous is not None
+        previous(observation)
+        sink(observation)
+
+    effective = sink if previous is None or previous is sink else fan_out
+    token = _observation_sink.set(effective)
     try:
         yield
     finally:

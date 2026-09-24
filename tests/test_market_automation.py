@@ -2088,6 +2088,103 @@ def test_unclassified_operation_failure_survives_later_same_endpoint_success() -
     ]
 
 
+def test_nested_transport_sinks_fan_out_once_and_restore_outer_sink() -> None:
+    outer = []
+    inner = []
+
+    def emit(request_id: str) -> None:
+        with (
+            refresh_scope("nested-refresh"),
+            provider_session_scope("nested-session"),
+            request_scope(
+                ProviderEndpoint.ALL_STOCK,
+                attempt=1,
+                page=1,
+                request_id=request_id,
+            ),
+        ):
+            emit_terminal_observation(
+                started_at=monotonic(),
+                protocol_stage=ProtocolStage.OPERATION,
+                recv_calls=0,
+                response_bytes=0,
+                end_marker_seen=False,
+                provider_code=None,
+                normalized_error=None,
+            )
+
+    with transport_observation_sink(outer.append):
+        with transport_observation_sink(inner.append):
+            emit("nested-request")
+        emit("outer-request")
+
+    assert [item.request_id for item in outer] == ["nested-request", "outer-request"]
+    assert [item.request_id for item in inner] == ["nested-request"]
+
+
+def test_internal_result_uses_observed_transport_timeout_for_retry_state(tmp_path: Path) -> None:
+    module = load_module("backend.app.market.automation")
+    store = MarketStore(tmp_path / "market.duckdb")
+
+    def canonical(**kwargs):
+        with (
+            refresh_scope(kwargs["run_id"]),
+            provider_session_scope("transport-session"),
+            request_scope(
+                ProviderEndpoint.ALL_STOCK,
+                attempt=1,
+                page=1,
+                request_id="transport-request",
+            ),
+        ):
+            emit_terminal_observation(
+                started_at=monotonic(),
+                protocol_stage=ProtocolStage.OPERATION,
+                recv_calls=1,
+                response_bytes=0,
+                end_marker_seen=False,
+                provider_code=None,
+                normalized_error=NormalizedTransportError.RECV_TIMEOUT,
+            )
+        now = datetime.now(UTC)
+        return RefreshResult(
+            run_id=kwargs["run_id"],
+            request_key=kwargs["request_key"],
+            run_kind="daily",
+            requested_date=kwargs["trade_date"],
+            source="baostock",
+            status="error",
+            requested_count=0,
+            succeeded_count=0,
+            coverage_ratio=0,
+            failed_symbols=[],
+            quality_issues=["market_refresh_failed"],
+            failure_stage="fetch",
+            failure_class="internal",
+            retryable=False,
+            started_at=now,
+            completed_at=now,
+        )
+
+    service = module.MarketAutomationService(
+        store,
+        CompleteProvider(fixture_bars()),
+        synthetic_calendar(),
+        required_symbols=set,
+        health_store=InMemoryProviderHealthStore(),
+        canonical_refresh=canonical,
+    )
+
+    outcome = service.run_due_once(datetime(2026, 7, 23, 18, 10, tzinfo=SHANGHAI))
+
+    assert outcome.result is not None
+    assert outcome.result.failure_class == "transport_timeout"
+    assert outcome.result.retryable is True
+    assert outcome.state.error_code == "transport_timeout"
+    assert outcome.state.refresh_state == "retry_wait"
+    assert outcome.state.next_retry_at == datetime(2026, 7, 23, 18, 40, tzinfo=SHANGHAI)
+
+
 @pytest.mark.parametrize(
     "mode",
     [

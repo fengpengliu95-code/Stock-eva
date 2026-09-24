@@ -2258,6 +2258,16 @@ class _RefreshObservationCollector:
             return None
         return max(errors, key=_TRANSPORT_ERROR_PRIORITY.__getitem__)
 
+    def dominant_observed_error(self) -> NormalizedTransportError | None:
+        errors = [
+            item.normalized_error
+            for item in self.observations
+            if item.protocol_stage == ProtocolStage.OPERATION and item.normalized_error is not None
+        ]
+        if not errors:
+            return None
+        return max(errors, key=_TRANSPORT_ERROR_PRIORITY.__getitem__)
+
     def probe_error(self, endpoint: ProviderEndpoint) -> NormalizedTransportError | None:
         endpoint_observations = [item for item in self.observations if item.endpoint == endpoint]
         operations = [
@@ -2946,6 +2956,31 @@ class MarketAutomationService:
                         lineage_input={"mode": "legacy"},
                     )
             collector.resolve_touched_endpoints()
+        if (
+            result.status == "error"
+            and result.failure_class == "internal"
+            and (observed_error := collector.dominant_observed_error()) is not None
+        ):
+            failure = MarketFailure(
+                failure_stage="fetch",
+                failure_class=(
+                    "transport_timeout"
+                    if observed_error == NormalizedTransportError.RECV_TIMEOUT
+                    else "rate_limit"
+                    if observed_error == NormalizedTransportError.RATE_LIMIT
+                    else "transport_connect"
+                ),
+                retryable=True,
+            )
+            result = result.model_copy(
+                update={
+                    "failure_stage": failure.failure_stage,
+                    "failure_class": failure.failure_class,
+                    "retryable": failure.retryable,
+                    "quality_issues": legacy_failure_quality_issues(failure),
+                    "error_message": public_failure_message(failure),
+                }
+            )
         if result.status == "ready":
             state = running.model_copy(
                 update={
