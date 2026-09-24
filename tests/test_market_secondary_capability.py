@@ -15,6 +15,7 @@ from backend.app.market.secondary_capability import (
     build_capability_evidence,
     build_tushare_candidate_bundle,
     evaluate_secondary_readiness,
+    read_secondary_readiness,
 )
 
 
@@ -239,6 +240,25 @@ def test_reader_detects_path_replacement_during_read(
     assert result.reason_code == "CONTROL_STATE_UNAVAILABLE"
 
 
+def test_reader_fails_closed_when_descriptor_close_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "capabilities.json"
+    _write_bundle(path)
+
+    def failed_close(descriptor: int) -> None:
+        raise OSError("sanitized close failure")
+
+    monkeypatch.setattr("backend.app.market.secondary_capability.os.close", failed_close)
+
+    result = CapabilityEvidenceReader(path).read()
+
+    assert result.status == "unavailable"
+    assert result.reason_code == "CONTROL_STATE_UNAVAILABLE"
+    assert result.provider_requests == 0
+    assert result.writes is False
+
+
 def test_tushare_official_candidate_qualifies_only_proven_semantics() -> None:
     bundle = build_tushare_candidate_bundle(
         review_id="review-tushare-official-20260918",
@@ -289,3 +309,30 @@ def test_tushare_candidate_rejects_invalid_review_or_document_hash() -> None:
         build_tushare_candidate_bundle(**{**values, "daily_document_sha256": "invalid"})
     with pytest.raises(ValidationError):
         build_tushare_candidate_bundle(**{**values, "review_id": "token=secret path/name"})
+    with pytest.raises(ValidationError):
+        build_tushare_candidate_bundle(**{**values, "observed_at": datetime(2026, 9, 18, 8)})
+
+
+def test_readiness_projection_is_read_only_and_fails_closed(tmp_path: Path) -> None:
+    path = tmp_path / "capabilities.json"
+    _write_bundle(path, _bundle("tushare"))
+    before = _fingerprint(path)
+
+    projected = read_secondary_readiness(path, provider_id="tushare")
+
+    assert projected.status == "ready"
+    assert projected.eligible_for_full_session_qualification is True
+    assert projected.canonical_failover_state == CapabilityState.UNQUALIFIED
+    assert projected.effective_auto_failover_enabled is False
+    assert projected.provider_requests == 0
+    assert projected.writes is False
+    assert _fingerprint(path) == before
+
+    mismatch = read_secondary_readiness(path, provider_id="tickflow")
+    missing = read_secondary_readiness(tmp_path / "missing.json", provider_id="tushare")
+    assert mismatch.status == "unavailable"
+    assert missing.status == "unavailable"
+    assert mismatch.blocked_reasons[0] == "CONTROL_STATE_UNAVAILABLE"
+    assert missing.provider_requests == 0
+    assert missing.writes is False
+    assert _fingerprint(path) == before

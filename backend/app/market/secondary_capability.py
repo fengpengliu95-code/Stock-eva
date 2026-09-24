@@ -7,12 +7,12 @@ import json
 import os
 import re
 import stat
-from datetime import datetime
+from datetime import datetime, timedelta
 from enum import StrEnum
 from pathlib import Path
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _SAFE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
@@ -101,6 +101,13 @@ class ReviewedCapabilityEvidenceV1(_Frozen):
     contract_sha256: str = Field(pattern=_SHA256.pattern)
     state: CapabilityState
     evidence_sha256: str = Field(pattern=_SHA256.pattern)
+
+    @field_validator("observed_at")
+    @classmethod
+    def require_utc_observation(cls, value: datetime) -> datetime:
+        if value.utcoffset() != timedelta(0):
+            raise ValueError("observed_at must be UTC")
+        return value
 
     @model_validator(mode="after")
     def validate_identity(self) -> ReviewedCapabilityEvidenceV1:
@@ -241,7 +248,10 @@ class CapabilityEvidenceReader:
             return self._unavailable()
         finally:
             if descriptor >= 0:
-                os.close(descriptor)
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    return self._unavailable()
 
 
 class SecondaryCanonicalReadinessV1(_Frozen):
@@ -472,6 +482,22 @@ def evaluate_secondary_readiness(
     )
 
 
+def read_secondary_readiness(
+    path: Path,
+    *,
+    provider_id: Literal["tickflow", "tushare"],
+) -> SecondaryCanonicalReadinessV1:
+    """Project a reviewed bundle without initializing state or contacting a provider."""
+    result = CapabilityEvidenceReader(path).read()
+    if (
+        result.status != "ready"
+        or result.bundle is None
+        or result.bundle.provider_id != provider_id
+    ):
+        return evaluate_secondary_readiness(provider_id, ())
+    return evaluate_secondary_readiness(provider_id, result.bundle.evidence)
+
+
 __all__ = [
     "CANONICAL_CAPABILITIES",
     "CapabilityEvidenceReadResult",
@@ -484,4 +510,5 @@ __all__ = [
     "build_capability_evidence",
     "build_tushare_candidate_bundle",
     "evaluate_secondary_readiness",
+    "read_secondary_readiness",
 ]

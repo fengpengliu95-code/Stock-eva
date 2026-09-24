@@ -63,11 +63,19 @@ sessions, one frozen version vector, qualified per-session outcomes and immutabl
 evidence/candidate/gate/selection lineage. Passing the offline window still leaves canonical and
 automatic failover disabled.
 
-## Task 5 — Independent review and installed read-only projection
+## Task 5 — Independent review and installed read-only projection — IMPLEMENTED / INSTALL PENDING
 
 After Tasks 1–4 are independently GO, add a read-only readiness projection. It may report eligibility
 to start qualification but must keep canonical failover and effective auto-failover false. Install only
 after full-suite verification. Refresh LaunchAgent remains disabled during acceptance.
+
+Local review found and closed admission gaps before installation: OHLC is now part of the complete
+candidate and its hash; non-finite prices, activity values and factors are rejected; request symbol,
+index and previous-factor sets are exact; observations require UTC; and descriptor-close failure is
+fail-closed. The qualification harness now requires a matching eligible capability-readiness hash
+before invoking the injected provider. A blocked or mismatched readiness returns zero attempts and
+zero provider requests. The path-based readiness projection is descriptor-safe, read-only and keeps
+canonical/automatic failover disabled. Production installation remains pending the final review gate.
 
 ## Deferred authorization gates
 

@@ -1,7 +1,14 @@
-from datetime import date, timedelta
+from datetime import UTC, date, datetime, timedelta
 
 import pytest
+from pydantic import ValidationError
 
+from backend.app.market.secondary_capability import (
+    CANONICAL_CAPABILITIES,
+    CapabilityState,
+    build_capability_evidence,
+    evaluate_secondary_readiness,
+)
 from backend.app.market.secondary_qualification import (
     CanonicalQualificationVersionVectorV1,
     OfflineQualificationHarness,
@@ -35,8 +42,25 @@ def _request() -> QualificationSessionRequestV1:
         required_indexes=("sh.000001",),
         previous_adjust_factors={"sh.600000": 1.0, "sz.000001": 1.1},
         version_vector=_vector(),
+        capability_readiness_sha256=_readiness().readiness_sha256,
         max_attempts=1,
     )
+
+
+def _readiness():
+    evidence = tuple(
+        build_capability_evidence(
+            provider_id="tushare",
+            capability=capability,
+            review_id=f"review-{capability}",
+            observed_at=datetime(2026, 9, 18, tzinfo=UTC),
+            official_document_sha256="a" * 64,
+            contract_sha256="b" * 64,
+            state=CapabilityState.QUALIFIED,
+        )
+        for capability in CANONICAL_CAPABILITIES
+    )
+    return evaluate_secondary_readiness("tushare", evidence)
 
 
 def _result(**changes: object) -> QualificationFetchResultV1:
@@ -45,7 +69,14 @@ def _result(**changes: object) -> QualificationFetchResultV1:
         "session_date": date(2026, 9, 17),
         "bars": (
             RawDailyBarV1(
-                symbol="sh.600000", source_provider="tushare", volume_lots=10, amount_thousand_cny=2
+                symbol="sh.600000",
+                source_provider="tushare",
+                open=10,
+                high=11,
+                low=9,
+                close=10.5,
+                volume_lots=10,
+                amount_thousand_cny=2,
             ),
         ),
         "suspended_symbols": ("sz.000001",),
@@ -74,7 +105,7 @@ class _FakeProvider:
 def test_complete_session_qualifies_once_and_converts_units_exactly_once() -> None:
     provider = _FakeProvider(_result())
 
-    outcome = OfflineQualificationHarness(provider).run(_request())
+    outcome = OfflineQualificationHarness(provider, readiness=_readiness()).run(_request())
 
     assert outcome.status == "qualified"
     assert outcome.reason_code is None
@@ -103,6 +134,10 @@ def test_complete_session_qualifies_once_and_converts_units_exactly_once() -> No
                     RawDailyBarV1(
                         symbol="sh.600000",
                         source_provider="tickflow",
+                        open=10,
+                        high=11,
+                        low=9,
+                        close=10.5,
                         volume_lots=10,
                         amount_thousand_cny=2,
                     ),
@@ -117,7 +152,7 @@ def test_session_failures_are_closed_and_never_retried(
 ) -> None:
     provider = _FakeProvider(result)
 
-    outcome = OfflineQualificationHarness(provider).run(_request())
+    outcome = OfflineQualificationHarness(provider, readiness=_readiness()).run(_request())
 
     assert outcome.status == "rejected"
     assert outcome.reason_code == reason
@@ -125,6 +160,70 @@ def test_session_failures_are_closed_and_never_retried(
     assert outcome.attempts == 1
     assert outcome.writes is False
     assert provider.calls == 1
+
+
+def test_malformed_provider_model_fails_closed_without_hash_exception() -> None:
+    malformed = _result().model_copy(update={"adjust_factors": {"sh.600000": float("nan")}})
+    provider = _FakeProvider(malformed)
+
+    outcome = OfflineQualificationHarness(provider, readiness=_readiness()).run(_request())
+
+    assert outcome.status == "rejected"
+    assert outcome.reason_code == "PROVIDER_ERROR"
+    assert outcome.provider_requests == 1
+    assert outcome.writes is False
+
+
+def test_request_rejects_duplicate_or_unsafe_contract_inputs() -> None:
+    request = _request().model_dump(mode="python")
+    with pytest.raises(ValidationError):
+        QualificationSessionRequestV1.model_validate(
+            {**request, "expected_symbols": ("sh.600000", "sh.600000")}
+        )
+    with pytest.raises(ValidationError):
+        QualificationSessionRequestV1.model_validate(
+            {**request, "required_indexes": ("not-an-index",)}
+        )
+
+
+def test_candidate_hash_binds_each_ohlc_value() -> None:
+    baseline = OfflineQualificationHarness(_FakeProvider(_result()), readiness=_readiness()).run(
+        _request()
+    )
+    changed_bar = _result().bars[0].model_copy(update={"close": 10.6})
+    changed = OfflineQualificationHarness(
+        _FakeProvider(_result(bars=(changed_bar,))), readiness=_readiness()
+    ).run(_request())
+
+    assert baseline.status == changed.status == "qualified"
+    assert baseline.candidate_sha256 != changed.candidate_sha256
+
+
+def test_blocked_capability_readiness_prevents_provider_construction_effect() -> None:
+    blocked = evaluate_secondary_readiness(
+        "tushare",
+        tuple(
+            build_capability_evidence(
+                provider_id="tushare",
+                capability=capability,
+                review_id=f"blocked-{capability}",
+                observed_at=datetime(2026, 9, 18, tzinfo=UTC),
+                official_document_sha256="a" * 64,
+                contract_sha256="b" * 64,
+                state=CapabilityState.UNKNOWN,
+            )
+            for capability in CANONICAL_CAPABILITIES
+        ),
+    )
+    provider = _FakeProvider(_result())
+
+    outcome = OfflineQualificationHarness(provider, readiness=blocked).run(_request())
+
+    assert outcome.status == "rejected"
+    assert outcome.reason_code == "CAPABILITY_NOT_READY"
+    assert outcome.provider_requests == 0
+    assert outcome.attempts == 0
+    assert provider.calls == 0
 
 
 def test_window_requires_twenty_sessions_and_one_frozen_vector() -> None:
