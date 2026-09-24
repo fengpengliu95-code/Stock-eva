@@ -29,6 +29,8 @@ qualification evidence, publish canonical data, or change any data-quality gate.
   existing first-install contract.
 - FR-5: Failure rollback MUST restore the exact prior loaded/unloaded state for every agent.
 - FR-6: Successful installation MUST report when disabled refresh state was preserved.
+- FR-7: Once refresh is explicitly enabled, its schedule MUST include a 16:00 Asia/Shanghai slot;
+  later bounded recovery slots MAY remain and MUST obey calendar and circuit gates.
 
 ## Non-Functional Requirements
 
@@ -68,12 +70,19 @@ Given the R2-F5.1 reviewed commit and verified local canonical dataset, when pro
 runs, then the runtime points to that commit, refresh remains unloaded and canonical fingerprints do
 not change.
 
+### AC-6: Trading-day close schedule (FR-7)
+
+Given the refresh LaunchAgent is explicitly enabled, when local time reaches 16:00, then one
+calendar-gated refresh evaluation runs; a non-trading day, open circuit or already-current session
+does not create an unconditional Provider request.
+
 ## Edge Cases
 
 - EC-1: Refresh plist exists but `launchctl print` fails: treat refresh as intentionally unloaded.
 - EC-2: Refresh was loaded but bootstrap fails: fail installation and restore the prior runtime.
 - EC-3: Disabled refresh plist replacement fails: fail installation and restore prior state.
 - EC-4: Runtime handoff succeeds but API/Web readiness fails: rollback without loading refresh.
+- EC-5: A machine wakes after 16:00: existing one-shot catch-up and idempotency rules apply.
 
 ## API Contracts
 
@@ -95,7 +104,7 @@ No database schema is added.
 
 ## Out of Scope
 
-- OS-1: Enabling scheduled refresh or changing its calendar.
+- OS-1: Changing provider retries, circuit thresholds or later recovery-slot timings.
 - OS-2: Provider canaries, retries, backfills or qualification observations.
 - OS-3: Canonical publication, pointer changes or data repair.
 - OS-4: General per-agent enable/disable policy; this contract is limited to the R2-F5.1 refresh

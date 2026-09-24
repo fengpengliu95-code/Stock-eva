@@ -82,6 +82,7 @@ def test_after_close_agent_uses_idempotent_backend_schedule() -> None:
     ]
     assert refresh["WorkingDirectory"] == str(CONFIG_ROOT)
     assert refresh["StartCalendarInterval"] == [
+        {"Hour": 16, "Minute": 0},
         {"Hour": 18, "Minute": 10},
         {"Hour": 18, "Minute": 40},
         {"Hour": 19, "Minute": 20},
