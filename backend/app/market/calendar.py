@@ -10,7 +10,7 @@ from zoneinfo import ZoneInfo
 from pydantic import BaseModel
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")
-DATA_AVAILABLE_AT = time(18, 10)
+DATA_AVAILABLE_AT = time(16, 0)
 MARKET_OPEN_AT = time(9, 30)
 MARKET_CLOSE_AT = time(15, 0)
 

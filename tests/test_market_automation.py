@@ -194,13 +194,13 @@ def test_calendar_fails_closed_outside_confirmed_year() -> None:
     assert calendar.session_status(date(2027, 1, 4)) == "unknown"
 
 
-def test_latest_expected_session_waits_until_1810_and_respects_holiday() -> None:
+def test_latest_expected_session_waits_until_1600_and_respects_holiday() -> None:
     calendar = synthetic_calendar()
 
-    assert calendar.latest_expected_session(datetime(2026, 7, 24, 18, 9, tzinfo=SHANGHAI)) == date(
+    assert calendar.latest_expected_session(datetime(2026, 7, 24, 15, 59, tzinfo=SHANGHAI)) == date(
         2026, 7, 23
     )
-    assert calendar.latest_expected_session(datetime(2026, 7, 24, 18, 10, tzinfo=SHANGHAI)) == date(
+    assert calendar.latest_expected_session(datetime(2026, 7, 24, 16, 0, tzinfo=SHANGHAI)) == date(
         2026, 7, 24
     )
     assert calendar.latest_expected_session(datetime(2026, 2, 17, 20, 0, tzinfo=SHANGHAI)) == date(
@@ -1644,11 +1644,15 @@ def test_complete_publication_requires_user_symbols_and_factor_completeness(
     assert store.published_refresh().run_id == ready.run_id
 
 
-def test_automation_machine_validates_calendar_before_fetch(tmp_path: Path) -> None:
+def test_automation_uses_confirmed_calendar_without_provider_calendar_preflight(
+    tmp_path: Path,
+) -> None:
     module = load_module("backend.app.market.automation")
     store = MarketStore(tmp_path / "market.duckdb")
     provider = CompleteProvider(fixture_bars())
-    provider.trading_dates = lambda start, end: []
+    provider.trading_dates = lambda start, end: (_ for _ in ()).throw(
+        AssertionError("daily refresh must not depend on provider calendar transport")
+    )
     service = module.MarketAutomationService(
         store,
         provider,
@@ -1658,10 +1662,10 @@ def test_automation_machine_validates_calendar_before_fetch(tmp_path: Path) -> N
 
     outcome = service.run_due_once(datetime(2026, 7, 23, 18, 10, tzinfo=SHANGHAI))
 
-    assert outcome.state.calendar_status == "conflict"
-    assert outcome.state.refresh_state == "error"
-    assert provider.fetch_calls == 0
-    assert store.published_refresh() is None
+    assert outcome.state.calendar_status == "confirmed"
+    assert outcome.state.refresh_state == "success"
+    assert provider.fetch_calls == 1
+    assert store.published_refresh() is not None
 
 
 def test_automation_publishes_once_and_does_not_repeat_success(
@@ -1685,7 +1689,7 @@ def test_automation_publishes_once_and_does_not_repeat_success(
     assert first.state.refresh_state == "success"
     assert second.decision.action == "none"
     assert provider.fetch_calls == 1
-    assert provider.calendar_calls == 1
+    assert provider.calendar_calls == 0
 
 
 def test_open_provider_skips_multiple_existing_slots_without_provider_or_publication_calls(
@@ -1848,7 +1852,8 @@ def test_successful_probe_waits_until_next_existing_slot_before_full_refresh(
     assert probe.state.error_code == "PROVIDER_PROBE_SUCCEEDED"
     assert waiting.decision.action == "wait"
     assert refreshed.result is not None and refreshed.result.status == "ready"
-    assert provider.calendar_calls == provider.fetch_calls == 1
+    assert provider.calendar_calls == 0
+    assert provider.fetch_calls == 1
     assert len(runner.calls) == 1
 
 
@@ -1897,7 +1902,7 @@ def test_expired_half_open_from_crashed_process_is_reprobed_on_next_existing_slo
     assert restarted.endpoint_health(endpoint).state == CircuitState.CLOSED
 
 
-def test_formal_calendar_and_fetch_share_refresh_id_and_resolve_each_touched_endpoint_once(
+def test_formal_fetch_resolves_each_touched_endpoint_once(
     tmp_path: Path,
 ) -> None:
     module = load_module("backend.app.market.automation")
@@ -1924,10 +1929,7 @@ def test_formal_calendar_and_fetch_share_refresh_id_and_resolve_each_touched_end
     )
     observations = health_store.list_observations()
     assert {item.refresh_id for item in observations} == {outcome.result.run_id}
-    assert {item.endpoint for item in observations} == {
-        ProviderEndpoint.TRADE_DATES,
-        ProviderEndpoint.ALL_STOCK,
-    }
+    assert {item.endpoint for item in observations} == {ProviderEndpoint.ALL_STOCK}
     assert health_store.endpoint_health(ProviderEndpoint.TRADE_DATES).consecutive_failures == 0
     assert health_store.endpoint_health(ProviderEndpoint.ALL_STOCK).consecutive_failures == 0
     restarted = SQLiteProviderHealthStore(health_path)
@@ -2215,10 +2217,11 @@ def test_provider_audit_write_failure_is_sanitized_and_prevents_publication(
 
     outcome = service.run_due_once(datetime(2026, 7, 23, 18, 10, tzinfo=SHANGHAI))
 
-    assert outcome.result is None
+    assert outcome.result is not None
+    assert outcome.result.status == "error"
     assert outcome.state.refresh_state == "error"
     assert store.published_refresh() is None
-    assert store.list_refreshes() == []
+    assert [item.status for item in store.list_refreshes()] == ["error"]
     assert secret not in caplog.text
 
 
@@ -2507,7 +2510,7 @@ def test_automation_retry_policy_uses_structured_retryable_failure(
     assert (outcome.state.next_retry_at is not None) is retryable
 
 
-def test_calendar_failure_is_not_scheduled_when_structured_failure_is_not_retryable(
+def test_provider_calendar_failure_does_not_block_confirmed_local_calendar(
     tmp_path: Path,
 ) -> None:
     module = load_module("backend.app.market.automation")
@@ -2532,10 +2535,10 @@ def test_calendar_failure_is_not_scheduled_when_structured_failure_is_not_retrya
 
     outcome = service.run_due_once(datetime(2026, 7, 23, 18, 10, tzinfo=SHANGHAI))
 
-    assert outcome.result is None
-    assert outcome.state.refresh_state == "error"
+    assert outcome.result is not None and outcome.result.status == "ready"
+    assert outcome.state.refresh_state == "success"
     assert outcome.state.next_retry_at is None
-    assert outcome.state.error_code == "calendar"
+    assert outcome.state.error_code is None
 
 
 def test_required_symbols_include_positions_and_all_watchlists() -> None:

@@ -2899,41 +2899,6 @@ class MarketAutomationService:
             return refresh_operation(refresh_id) if callable(refresh_operation) else nullcontext()
 
         with transport_observation_sink(collector.record):
-            try:
-                with provider_scope():
-                    provider_sessions = self.provider.trading_dates(target, target)
-            except Exception as error:
-                collector.resolve_touched_endpoints()
-                failure = market_failure_from_exception(error, stage="validate")
-                state = self._failed_state(
-                    running,
-                    local,
-                    error_code=failure.failure_class,
-                    calendar_status="unavailable",
-                    retryable=failure.retryable,
-                    policy=policy,
-                )
-                self.store.save_scheduler_state(state)
-                _log_event(
-                    logging.ERROR,
-                    "market_calendar_validation_failed",
-                    failure_stage=failure.failure_stage,
-                    failure_class=failure.failure_class,
-                    retryable=failure.retryable,
-                )
-                return AutomationOutcome(decision=decision, state=state)
-            if provider_sessions != [target]:
-                collector.resolve_touched_endpoints()
-                state = running.model_copy(
-                    update={
-                        "refresh_state": "error",
-                        "calendar_status": "conflict",
-                        "error_code": "calendar_provider_conflict",
-                    }
-                )
-                self.store.save_scheduler_state(state)
-                return AutomationOutcome(decision=decision, state=state)
-
             if self.canonical_refresh is not None:
                 canonical_kwargs = {
                     "trade_date": target,

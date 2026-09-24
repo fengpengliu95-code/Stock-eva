@@ -7,7 +7,7 @@ Stock EVA 使用 5 个当前用户级 LaunchAgent，不需要管理员权限，�
 | --- | --- | --- |
 | `com.finlay.stock-eva.api` | FastAPI | 登录后启动，异常退出自动恢复 |
 | `com.finlay.stock-eva.web` | 静态工作台 | 登录后启动，异常退出自动恢复 |
-| `com.finlay.stock-eva.refresh` | 日终刷新、策略与预警流水线 | 18:10、18:40、19:20、20:10、21:00、次晨 07:15 |
+| `com.finlay.stock-eva.refresh` | 日终刷新、策略与预警流水线 | 16:00、18:10、18:40、19:20、20:10、21:00、次晨 07:15 |
 | `com.finlay.stock-eva.calendar` | 官方日历机器对账 | 登录启动、每日 16:30、每月 1 日 04:05 |
 | `com.finlay.stock-eva.backup` | 私有 SQLite 一致性备份 | 每日 02:30 |
 
