@@ -228,12 +228,24 @@ def test_schedule_policy_runs_catch_up_and_uses_finite_retry_slots() -> None:
     policy = module.SchedulePolicy(calendar)
 
     first = policy.decide(
-        datetime(2026, 7, 24, 18, 10, tzinfo=SHANGHAI),
+        datetime(2026, 7, 24, 16, 0, tzinfo=SHANGHAI),
         published_as_of=date(2026, 7, 23),
         state=None,
     )
     assert first.action == "run"
     assert first.target_session == date(2026, 7, 24)
+
+    stale_state_catch_up = policy.decide(
+        datetime(2026, 7, 24, 16, 31, tzinfo=SHANGHAI),
+        published_as_of=date(2026, 7, 23),
+        state=module.SchedulerState(
+            target_session=date(2026, 7, 23),
+            refresh_state="delayed",
+            attempt_count=1,
+        ),
+    )
+    assert stale_state_catch_up.action == "run"
+    assert stale_state_catch_up.target_session == date(2026, 7, 24)
 
     failed = module.SchedulerState(
         target_session=date(2026, 7, 24),

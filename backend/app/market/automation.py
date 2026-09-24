@@ -2303,7 +2303,7 @@ class SchedulePolicy:
 
     @staticmethod
     def availability_for(session: date) -> datetime:
-        return datetime.combine(session, time(18, 10), tzinfo=SHANGHAI)
+        return datetime.combine(session, time(16, 0), tzinfo=SHANGHAI)
 
     def next_retry_after(self, session: date, after: datetime) -> datetime | None:
         local = after.astimezone(SHANGHAI)
