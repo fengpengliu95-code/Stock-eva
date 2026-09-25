@@ -94,6 +94,9 @@ class _EofAwareSocket:
         payload = self._connection.recv(*args, **kwargs)
         if payload == b"":
             raise ConnectionResetError("BaoStock closed the connection before the response ended")
+        progress = _deadline_progress.get()
+        if progress is not None:
+            progress()
         return payload
 
     def __getattr__(self, name: str) -> Any:
@@ -152,6 +155,12 @@ class _OperationDeadlineUnavailable(BaoStockError):
 
 class _PreexistingTimerInterrupt(BaseException):
     pass
+
+
+_deadline_progress: ContextVar[Callable[[], None] | None] = ContextVar(
+    "baostock_deadline_progress",
+    default=None,
+)
 
 
 def _pagination_protocol_error(
@@ -249,6 +258,15 @@ def _wall_clock_deadline(seconds: float):
     previous_fired = False
     started_at = monotonic()
 
+    def renew() -> None:
+        nonlocal previous_fires_first
+        previous_remaining = previous_delay - (monotonic() - started_at)
+        previous_fires_first = previous_delay > 0 and previous_remaining <= seconds
+        signal.setitimer(
+            signal.ITIMER_REAL,
+            max(previous_remaining, 1e-6) if previous_fires_first else seconds,
+        )
+
     def raise_deadline(signum, frame):
         nonlocal previous_fired
         if previous_fires_first:
@@ -263,7 +281,7 @@ def _wall_clock_deadline(seconds: float):
     signal.signal(signal.SIGALRM, raise_deadline)
     signal.setitimer(signal.ITIMER_REAL, timer_delay)
     try:
-        yield
+        yield renew
     finally:
         signal.setitimer(signal.ITIMER_REAL, 0)
         signal.signal(signal.SIGALRM, previous_handler)
@@ -697,8 +715,12 @@ class BaoStockProvider:
 
     def _run_with_deadline(self, operation, *, operation_name: str):
         try:
-            with _wall_clock_deadline(self.socket_timeout_seconds):
-                return operation()
+            with _wall_clock_deadline(self.socket_timeout_seconds) as renew:
+                token = _deadline_progress.set(renew)
+                try:
+                    return operation()
+                finally:
+                    _deadline_progress.reset(token)
         except OperationDeadlineInterrupt:
             self._discard_session()
             raise _OperationDeadlineExceeded(

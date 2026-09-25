@@ -50,6 +50,12 @@ endpoint prevents all daily-bar endpoints from being attempted.
   the socket/receive timeout: a blocking initial response or any single page
   transition still fails within the same configured bound, discards the
   session, and invalidates the full candidate.
+- FR-5: Within one response frame, each non-empty socket `recv` is transport
+  progress and MUST renew the same configured wall-clock deadline. The bound is
+  therefore an inactivity deadline, not a total-response-size deadline. An
+  empty recv, a recv with no bytes before the unchanged deadline, an excessive
+  response size/call count, or a missing end marker still fails closed with the
+  existing socket-level evidence.
 - NFR-1: Observation fan-out MUST preserve fail-closed audit behavior: an
   exception from either sink aborts the operation and no canonical pointer is
   advanced.
@@ -83,6 +89,9 @@ endpoint prevents all daily-bar endpoints from being attempted.
     each below the configured deadline may exceed that duration in aggregate
     and still complete; a blocking transition fails within one unchanged
     deadline and retains its page-level `RECV_TIMEOUT` observation.
+11. A response that takes longer than the configured deadline in aggregate but
+    delivers non-empty chunks within every deadline window completes; a socket
+    that stops making byte progress still times out within the unchanged bound.
 
 ## API contracts
 

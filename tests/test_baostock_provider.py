@@ -845,6 +845,33 @@ def test_each_pagination_network_step_gets_the_unchanged_deadline() -> None:
     assert rows == [[f"sh.60000{index}"] for index in range(5)]
 
 
+def test_nonempty_recv_progress_renews_the_unchanged_deadline() -> None:
+    class ProgressSocket(FakeSocket):
+        def recv(self, _size) -> bytes:
+            time.sleep(0.015)
+            return b"x"
+
+    timeout = 0.025
+    client = FakeBaoStock(json.loads(FIXTURE_PATH.read_text()))
+    client.context = SimpleNamespace(default_socket=ProgressSocket())
+    provider = BaoStockProvider(
+        client=client,
+        max_attempts=1,
+        min_request_interval_seconds=0,
+        socket_timeout_seconds=timeout,
+    )
+    provider._configure_socket_timeout()
+
+    started_at = time.monotonic()
+    chunks = provider._run_with_deadline(
+        lambda: [client.context.default_socket.recv(1) for _ in range(3)],
+        operation_name="request",
+    )
+
+    assert time.monotonic() - started_at > timeout
+    assert chunks == [b"x", b"x", b"x"]
+
+
 def test_deadline_never_leaves_uncancellable_request_workers() -> None:
     client = NeverReleasedRequestClient()
     provider = BaoStockProvider(
