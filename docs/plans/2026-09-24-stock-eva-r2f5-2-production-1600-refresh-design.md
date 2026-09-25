@@ -56,6 +56,11 @@ endpoint prevents all daily-bar endpoints from being attempted.
   empty recv, a recv with no bytes before the unchanged deadline, an excessive
   response size/call count, or a missing end marker still fails closed with the
   existing socket-level evidence.
+- FR-6: BaoStock `query_daily_adjust_factor` may expose the exact five-field
+  wire schema ending in the provider typo `adjustFacto`. The adapter MUST map
+  only that exact alias to the existing `adjustFactor` contract field before
+  typed validation/evidence. Missing fields, reordered fields, or any other
+  alias remain fail-closed; the canonical factor model and gates do not change.
 - NFR-1: Observation fan-out MUST preserve fail-closed audit behavior: an
   exception from either sink aborts the operation and no canonical pointer is
   advanced.
@@ -92,6 +97,9 @@ endpoint prevents all daily-bar endpoints from being attempted.
 11. A response that takes longer than the configured deadline in aggregate but
     delivers non-empty chunks within every deadline window completes; a socket
     that stops making byte progress still times out within the unchanged bound.
+12. The exact observed `daily_factor` wire alias `adjustFacto` produces the
+    unchanged typed `adjustFactor` field, while unknown factor schemas fail
+    before evidence or canonical publication.
 
 ## API contracts
 

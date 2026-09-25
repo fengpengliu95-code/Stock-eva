@@ -47,6 +47,13 @@ from .base import (
 _DAILY_WIRE_FIELDS = tuple(
     DAILY_FIELDS.split(",")[:-1] + ["peTTM", "pbMRQ", "psTTM", "pcfNcfTTM", "isST"]
 )
+_DAILY_FACTOR_WIRE_FIELDS = (
+    "code",
+    "dividOperateDate",
+    "foreAdjustFactor",
+    "backAdjustFactor",
+    "adjustFacto",
+)
 
 
 class BaoStockProviderAdapter:
@@ -315,6 +322,22 @@ class BaoStockProviderAdapter:
 
     @staticmethod
     def _project_known_wire_schema(endpoint, contract_fields, fields, captured_pages):
+        if endpoint is TransportEndpoint.DAILY_FACTOR and tuple(fields) == (
+            _DAILY_FACTOR_WIRE_FIELDS
+        ):
+            if any(tuple(page[4]) != _DAILY_FACTOR_WIRE_FIELDS for page in captured_pages):
+                raise ValueError("source schema does not match endpoint contract")
+            return list(contract_fields), [
+                (
+                    attempt,
+                    page,
+                    request_id,
+                    session_id,
+                    list(contract_fields),
+                    rows,
+                )
+                for attempt, page, request_id, session_id, _page_fields, rows in captured_pages
+            ]
         if endpoint is not TransportEndpoint.DAILY_ASTOCK or tuple(fields) != _DAILY_WIRE_FIELDS:
             return fields, captured_pages
         if any(tuple(page[4]) != _DAILY_WIRE_FIELDS for page in captured_pages):

@@ -1228,6 +1228,46 @@ def test_baostock_adapter_rejects_unknown_daily_wire_superset() -> None:
         adapter.fetch_raw(_provider_request())
 
 
+def test_baostock_adapter_maps_exact_daily_factor_wire_alias() -> None:
+    class DailyFactorAliasClient(_CompleteSdkClient):
+        def query_daily_adjust_factor(self, **kwargs):
+            self._record("query_daily_adjust_factor", kwargs)
+            return _SdkResult(
+                [
+                    "code",
+                    "dividOperateDate",
+                    "foreAdjustFactor",
+                    "backAdjustFactor",
+                    "adjustFacto",
+                ],
+                [["sh.600000", self.response_date, "1", "0.8", "0.8"]],
+            )
+
+    logical = _plan(
+        endpoint=ProviderEndpoint.DAILY_FACTOR,
+        role=RequestRole.DAILY_FACTOR,
+        instrument=InstrumentRole.STOCK,
+        variant="daily_factor.v1",
+        symbols=("sh.600000",),
+    )
+    adapter = BaoStockProviderAdapter(
+        client=DailyFactorAliasClient(),
+        max_attempts=1,
+        min_request_interval_seconds=0,
+    )
+
+    raw = adapter.fetch_raw(
+        _provider_request(
+            plan=_plan_container(logical),
+            session_symbols=("sh.600000",),
+        )
+    )
+
+    batch = raw.endpoint_batches[0]
+    assert batch.fields[-1] == "adjustFactor"
+    assert batch.rows[0].adjustFactor == 0.8
+
+
 def test_baostock_adapter_publishes_one_source_batch_per_final_success_page() -> None:
     client = _TwoPageRetrySdkClient()
     adapter = BaoStockProviderAdapter(client=client, max_attempts=2, min_request_interval_seconds=0)
