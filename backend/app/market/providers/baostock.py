@@ -44,6 +44,10 @@ from .base import (
     validate_raw_date_binding,
 )
 
+_DAILY_WIRE_FIELDS = tuple(
+    DAILY_FIELDS.split(",")[:-1] + ["peTTM", "pbMRQ", "psTTM", "pcfNcfTTM", "isST"]
+)
+
 
 class BaoStockProviderAdapter:
     provider_id = ProviderId.BAOSTOCK
@@ -151,6 +155,9 @@ class BaoStockProviderAdapter:
                 pagination_terminal=lambda: terminals.append(1),
                 capture_all_operation_outcomes=True,
             )
+        fields, captured_pages = self._project_known_wire_schema(
+            endpoint, contract.fields, fields, captured_pages
+        )
         local = tuple(
             item for item in raw_observations[observation_start:] if item.endpoint is endpoint
         )
@@ -305,6 +312,26 @@ class BaoStockProviderAdapter:
             row_count=sum(page.row_count for page in endpoint_batches),
         )
         return endpoint_batches, completion, page_lineages, local_projections, summary
+
+    @staticmethod
+    def _project_known_wire_schema(endpoint, contract_fields, fields, captured_pages):
+        if endpoint is not TransportEndpoint.DAILY_ASTOCK or tuple(fields) != _DAILY_WIRE_FIELDS:
+            return fields, captured_pages
+        if any(tuple(page[4]) != _DAILY_WIRE_FIELDS for page in captured_pages):
+            raise ValueError("source schema does not match endpoint contract")
+        positions = tuple(_DAILY_WIRE_FIELDS.index(field) for field in contract_fields)
+        projected_pages = [
+            (
+                attempt,
+                page,
+                request_id,
+                session_id,
+                list(contract_fields),
+                [[row[position] for position in positions] for row in rows],
+            )
+            for attempt, page, request_id, session_id, _page_fields, rows in captured_pages
+        ]
+        return list(contract_fields), projected_pages
 
     @staticmethod
     def _projection(item, entries, *, default_kind):

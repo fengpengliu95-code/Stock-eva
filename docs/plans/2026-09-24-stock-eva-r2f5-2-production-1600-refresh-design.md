@@ -37,6 +37,13 @@ endpoint prevents all daily-bar endpoints from being attempted.
   its terminal socket observations contain a normalized transport error, the
   scheduler MUST use the observed transport failure class and retryability.
   It MUST NOT reinterpret a successful transport observation as an error.
+- FR-3: BaoStock `query_daily_history_k_AStock` may return the provider's exact
+  18-field daily wire schema by inserting `peTTM,pbMRQ,psTTM,pcfNcfTTM` before
+  `isST`. The adapter MUST accept only that exact known superset (or the legacy
+  exact 14-field schema), project it deterministically to the existing
+  `daily_astock.v1` 14-field contract before typed validation/evidence, and
+  discard no contract field. Any reordered, missing, or otherwise extended
+  schema remains fail-closed.
 - NFR-1: Observation fan-out MUST preserve fail-closed audit behavior: an
   exception from either sink aborts the operation and no canonical pointer is
   advanced.
@@ -63,6 +70,9 @@ endpoint prevents all daily-bar endpoints from being attempted.
    terminal transport error, the internal classification is preserved. (FR-2)
 8. Given either sink fails, the operation raises and canonical publication
    remains unchanged. (NFR-1)
+9. An exact BaoStock 18-field daily response is projected to the unchanged
+   14-field `daily_astock.v1` rows, including `isST`; arbitrary supersets and
+   reordered schemas still fail before evidence or canonical publication.
 
 ## API contracts
 
@@ -81,6 +91,8 @@ and `SchedulerState` models are reused.
 - EC-3: Provider status/rate-limit evidence maps to its existing typed class;
   unknown protocol errors remain retryable transport failures without guessed
   provider semantics.
+- EC-4: Wire-schema projection is endpoint-specific to `daily_astock`; index
+  history and every other endpoint retain exact existing schema equality.
 
 ## Out of scope
 

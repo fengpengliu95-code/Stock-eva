@@ -1185,6 +1185,49 @@ def test_baostock_adapter_rejects_every_nonexact_sdk_source_schema(
         adapter.fetch_raw(request)
 
 
+def test_baostock_adapter_projects_exact_daily_wire_superset_to_contract() -> None:
+    class DailyWireSupersetClient(_CompleteSdkClient):
+        def query_daily_history_k_AStock(self, **kwargs):
+            self._record("query_daily_history_k_AStock", kwargs)
+            fields = DAILY_FIELDS.split(",")[:-1] + [
+                "peTTM",
+                "pbMRQ",
+                "psTTM",
+                "pcfNcfTTM",
+                "isST",
+            ]
+            values = dict(zip(DAILY_FIELDS.split(","), self._daily_row("sh.600000"), strict=True))
+            values.update({"peTTM": "8", "pbMRQ": "1", "psTTM": "2", "pcfNcfTTM": "3"})
+            return _SdkResult(fields, [[values[field] for field in fields]])
+
+    adapter = BaoStockProviderAdapter(
+        client=DailyWireSupersetClient(),
+        max_attempts=1,
+        min_request_interval_seconds=0,
+    )
+
+    raw = adapter.fetch_raw(_provider_request())
+
+    batch = raw.endpoint_batches[0]
+    assert batch.fields == tuple(DAILY_FIELDS.split(","))
+    assert batch.rows[0].code == "sh.600000"
+    assert batch.rows[0].isST == "0"
+    assert not hasattr(batch.rows[0], "peTTM")
+
+
+def test_baostock_adapter_rejects_unknown_daily_wire_superset() -> None:
+    fields = DAILY_FIELDS.split(",") + ["unknownMetric"]
+    client = _CompleteSdkClient(schema_overrides={"daily_astock": fields})
+    adapter = BaoStockProviderAdapter(
+        client=client,
+        max_attempts=1,
+        min_request_interval_seconds=0,
+    )
+
+    with pytest.raises(ValueError, match="source schema"):
+        adapter.fetch_raw(_provider_request())
+
+
 def test_baostock_adapter_publishes_one_source_batch_per_final_success_page() -> None:
     client = _TwoPageRetrySdkClient()
     adapter = BaoStockProviderAdapter(client=client, max_attempts=2, min_request_interval_seconds=0)
