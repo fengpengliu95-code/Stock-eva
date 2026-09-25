@@ -692,6 +692,44 @@ class DeadlineBlockingClient:
             connection.close()
 
 
+class SlowBoundedPageResult:
+    fields = ["code"]
+    error_code = "0"
+    error_msg = ""
+    per_page_count = 2
+
+    def __init__(self, transition_seconds: float) -> None:
+        self.transition_seconds = transition_seconds
+        self.pages = [
+            [["sh.600000"], ["sh.600001"]],
+            [["sh.600002"], ["sh.600003"]],
+            [["sh.600004"]],
+        ]
+        self.page_index = 0
+        self.data = self.pages[0]
+        self.cur_page_num = "1"
+        self.cur_row_num = 0
+        self.current = None
+
+    def next(self) -> bool:
+        if self.cur_row_num < len(self.data):
+            self.current = self.data[self.cur_row_num]
+            self.cur_row_num += 1
+            return True
+        if self.page_index + 1 >= len(self.pages):
+            return False
+        time.sleep(self.transition_seconds)
+        self.page_index += 1
+        self.data = self.pages[self.page_index]
+        self.cur_page_num = str(self.page_index + 1)
+        self.cur_row_num = 1
+        self.current = self.data[0]
+        return True
+
+    def get_row_data(self):
+        return self.current
+
+
 class NoOpCloseSocket(FakeSocket):
     def shutdown(self, _how) -> None:
         pass
@@ -782,6 +820,29 @@ def test_retry_attempts_have_a_derived_total_wall_clock_bound() -> None:
         expected_seconds=(provider.max_attempts * timeout) + 0.15,
     )
     assert client.query_calls == provider.max_attempts
+
+
+def test_each_pagination_network_step_gets_the_unchanged_deadline() -> None:
+    timeout = 0.025
+    step_seconds = 0.015
+    client = FakeBaoStock(json.loads(FIXTURE_PATH.read_text()))
+    provider = BaoStockProvider(
+        client=client,
+        max_attempts=1,
+        min_request_interval_seconds=0,
+        socket_timeout_seconds=timeout,
+    )
+    provider._login(ProviderEndpoint.ALL_STOCK)
+
+    started_at = time.monotonic()
+    fields, rows = provider._read(
+        ProviderEndpoint.ALL_STOCK,
+        lambda: time.sleep(step_seconds) or SlowBoundedPageResult(step_seconds),
+    )
+
+    assert time.monotonic() - started_at > timeout
+    assert fields == ["code"]
+    assert rows == [[f"sh.60000{index}"] for index in range(5)]
 
 
 def test_deadline_never_leaves_uncancellable_request_workers() -> None:

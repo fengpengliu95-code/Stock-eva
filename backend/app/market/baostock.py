@@ -285,6 +285,7 @@ def _read_result(
     *,
     before_page_request: Callable[[], None] | None = None,
     next_page_scope: Callable[[int], Any] | None = None,
+    page_advance: Callable[[], bool] | None = None,
     page_capture: Callable[[int, list[str], list[list[str]]], None] | None = None,
     pagination_terminal: Callable[[], None] | None = None,
 ) -> tuple[list[str], list[list[str]]]:
@@ -336,7 +337,7 @@ def _read_result(
             page_fingerprints.add(current_fingerprint)
             before_page_request()
             with next_page_scope(current_page + 1):
-                has_row = result.next()
+                has_row = page_advance() if page_advance is not None else result.next()
                 if result.error_code != "0":
                     raise _provider_status_error(
                         result.error_code,
@@ -1083,7 +1084,10 @@ class BaoStockProvider:
                     with self._request_scope(endpoint, attempt=attempt, page=1):
 
                         def read_attempt(attempt=attempt):
-                            result = operation()
+                            result = self._run_with_deadline(
+                                operation,
+                                operation_name="request",
+                            )
                             return _read_result(
                                 result,
                                 before_page_request=self._pace_request,
@@ -1091,6 +1095,10 @@ class BaoStockProvider:
                                     endpoint,
                                     attempt=attempt,
                                     page=page,
+                                ),
+                                page_advance=lambda: self._run_with_deadline(
+                                    result.next,
+                                    operation_name="pagination",
                                 ),
                                 page_capture=(
                                     None
@@ -1108,10 +1116,7 @@ class BaoStockProvider:
                             )
 
                         try:
-                            result = self._run_with_deadline(
-                                read_attempt,
-                                operation_name="request",
-                            )
+                            result = read_attempt()
                         except (BaoStockError, TimeoutError, OSError) as exc:
                             if isinstance(endpoint, ProviderEndpoint) and (
                                 capture_all_operation_outcomes

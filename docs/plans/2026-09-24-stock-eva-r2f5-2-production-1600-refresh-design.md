@@ -44,6 +44,12 @@ endpoint prevents all daily-bar endpoints from being attempted.
   `daily_astock.v1` 14-field contract before typed validation/evidence, and
   discard no contract field. Any reordered, missing, or otherwise extended
   schema remains fail-closed.
+- FR-4: The configured transport deadline applies independently to the initial
+  BaoStock request and to each provider pagination transition. It MUST NOT be a
+  cumulative deadline across already completed pages. This does not increase
+  the socket/receive timeout: a blocking initial response or any single page
+  transition still fails within the same configured bound, discards the
+  session, and invalidates the full candidate.
 - NFR-1: Observation fan-out MUST preserve fail-closed audit behavior: an
   exception from either sink aborts the operation and no canonical pointer is
   advanced.
@@ -73,6 +79,10 @@ endpoint prevents all daily-bar endpoints from being attempted.
 9. An exact BaoStock 18-field daily response is projected to the unchanged
    14-field `daily_astock.v1` rows, including `isST`; arbitrary supersets and
    reordered schemas still fail before evidence or canonical publication.
+10. A deterministic multi-page response whose individual page transitions are
+    each below the configured deadline may exceed that duration in aggregate
+    and still complete; a blocking transition fails within one unchanged
+    deadline and retains its page-level `RECV_TIMEOUT` observation.
 
 ## API contracts
 
@@ -93,6 +103,9 @@ and `SchedulerState` models are reused.
   provider semantics.
 - EC-4: Wire-schema projection is endpoint-specific to `daily_astock`; index
   history and every other endpoint retain exact existing schema equality.
+- EC-5: Resetting the deadline between pages MUST preserve a pre-existing
+  earlier process timer, duplicate/repeated-page detection, end-marker checks,
+  and the derived bound of at most one deadline per attempted network step.
 
 ## Out of scope
 
