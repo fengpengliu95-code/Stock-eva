@@ -928,8 +928,14 @@ class BaoStockProvider:
                     ProviderEndpoint.ALL_STOCK,
                     lambda: self.client.query_all_stock(day=trade_date.isoformat()),
                 )
-                code_index = fields.index("code")
-                symbol_rows = [row[code_index] for row in rows if _is_main_board(row[code_index])]
+                positions = _required_field_positions(fields, ("code", "tradeStatus"))
+                code_index = positions["code"]
+                status_index = positions["tradeStatus"]
+                symbol_rows = [
+                    row[code_index]
+                    for row in rows
+                    if _is_main_board(row[code_index]) and row[status_index] == "1"
+                ]
                 _require_unique_symbols(symbol_rows)
                 symbols = set(symbol_rows)
                 shanghai = sum(symbol.startswith("sh.") for symbol in symbols)
@@ -1275,11 +1281,13 @@ class BaoStockProvider:
         universe_fields, universe_rows = self._read(
             ProviderEndpoint.ALL_STOCK, lambda: self.client.query_all_stock(day=iso_date)
         )
-        universe_code_index = _required_field_positions(universe_fields, ("code",))["code"]
+        universe_positions = _required_field_positions(universe_fields, ("code", "tradeStatus"))
+        universe_code_index = universe_positions["code"]
+        universe_status_index = universe_positions["tradeStatus"]
         main_symbol_rows = [
             row[universe_code_index]
             for row in universe_rows
-            if _is_main_board(row[universe_code_index])
+            if _is_main_board(row[universe_code_index]) and row[universe_status_index] == "1"
         ]
         _require_unique_symbols(main_symbol_rows)
         main_symbols = set(main_symbol_rows)

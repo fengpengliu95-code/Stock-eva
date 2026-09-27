@@ -87,6 +87,9 @@ endpoint prevents all daily-bar endpoints from being attempted.
   complete logical request, not every individual page, owns the non-empty
   universe requirement. All retained pages are combined for exact plan
   equality validation.
+  The preflight `inspect_main_board` plan builder MUST use the identical
+  `tradeStatus=1` main-board definition so the immutable request plan and RAW
+  universe cannot diverge by construction.
 - FR-10a: BaoStock `daily_astock` is also an all-market transport result. The
   RAW adapter MUST retain only symbols in the immutable daily-stock logical
   request and sort retained rows by `(date, code)` before typed validation.

@@ -1314,6 +1314,32 @@ def test_baostock_adapter_filters_all_stock_to_active_main_board() -> None:
     )
 
 
+def test_main_board_inspection_uses_active_universe_semantics() -> None:
+    class MixedUniverseClient(_CompleteSdkClient):
+        def query_all_stock(self, **kwargs):
+            self._record("query_all_stock", kwargs)
+            return _SdkResult(
+                ["code", "tradeStatus", "code_name"],
+                [
+                    ["sh.600000", "1", "kept-sh"],
+                    ["sz.000001", "0", "inactive"],
+                    ["sz.002001", "1", "kept-sz"],
+                    ["sz.300001", "1", "chinext"],
+                ],
+            )
+
+    adapter = BaoStockProviderAdapter(
+        client=MixedUniverseClient(),
+        max_attempts=1,
+        min_request_interval_seconds=0,
+    )
+
+    inspection = adapter.inspect_main_board(date(2026, 8, 20))
+
+    assert inspection.main_board_symbols == ("sh.600000", "sz.002001")
+    assert inspection.main_board_count == 2
+
+
 def test_baostock_adapter_filters_daily_astock_to_planned_symbols() -> None:
     class MixedDailyClient(_CompleteSdkClient):
         def query_daily_history_k_AStock(self, **kwargs):
