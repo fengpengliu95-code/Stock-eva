@@ -72,6 +72,12 @@ endpoint prevents all daily-bar endpoints from being attempted.
   subset. Full factor coverage remains mandatory through the immutable factor
   resolution snapshot, whose symbols MUST still equal the complete planned
   stock universe exactly.
+- FR-9: Before immutable evidence capture, the canonical adapter MUST prove an
+  exact full-universe factor snapshot for the target session. If the cache is
+  stale, it MUST advance the existing contiguous BaoStock daily-event stream
+  through every intervening trading session and materialize the target
+  snapshot; a partial stream or incomplete snapshot fails closed. An already
+  complete exact snapshot MUST not cause extra provider requests.
 - NFR-1: Observation fan-out MUST preserve fail-closed audit behavior: an
   exception from either sink aborts the operation and no canonical pointer is
   advanced.
@@ -114,6 +120,9 @@ endpoint prevents all daily-bar endpoints from being attempted.
 13. A daily-factor response containing both requested main-board symbols and
     other-board symbols publishes evidence only for the requested set; it does
     not weaken the full main-board factor-resolution gate.
+14. A stale but contiguous factor cache is advanced through the target session
+    before evidence capture, while an already complete target snapshot remains
+    a zero-request fast path.
 
 ## API contracts
 

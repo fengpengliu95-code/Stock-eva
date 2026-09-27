@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Sequence
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from hashlib import sha256
 
 from backend.app.market.baostock import DAILY_FIELDS, capture_registry
@@ -64,6 +64,7 @@ class BaoStockProviderAdapter:
     def __init__(self, client: object | None = None, **kwargs: object) -> None:
         self._incumbent = IncumbentBaoStockProvider(client=client, **kwargs)
         self.client = self._incumbent.client
+        self.factor_cache = self._incumbent.factor_cache
         self.max_attempts = self._incumbent.max_attempts
 
     def fetch(self, trade_date, symbols: Sequence[str] | None = None):
@@ -81,6 +82,27 @@ class BaoStockProviderAdapter:
 
     def inspect_main_board(self, trade_date):
         return self._incumbent.inspect_main_board(trade_date)
+
+    def ensure_factor_snapshot(self, symbols: Sequence[str], trade_date: date) -> None:
+        """Advance the incumbent factor stream until an exact target snapshot exists."""
+        requested = tuple(sorted(set(str(symbol).lower() for symbol in symbols)))
+        if not requested:
+            raise ValueError("factor snapshot requires symbols")
+        cache = self.factor_cache
+
+        def covered() -> bool:
+            rows = cache.exact_snapshot_records(requested, trade_date)
+            return tuple(str(row["symbol"]) for row in rows) == requested
+
+        if covered():
+            return
+        self._incumbent._login(TransportEndpoint.DAILY_FACTOR)
+        try:
+            self._incumbent._main_board_factor_snapshot(trade_date, requested)
+        finally:
+            self._incumbent._logout()
+        if not covered():
+            raise ValueError("factor snapshot does not exactly cover requested symbols")
 
     def fetch_raw(self, request: ProviderRequest) -> ProviderRawBatch:
         started_at = datetime.now(UTC)

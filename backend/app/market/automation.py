@@ -1877,6 +1877,8 @@ def canonical_refresh_callback(
 
         with adapter_scope():
             try:
+                if adapter.factor_cache is factor_cache:
+                    adapter.ensure_factor_snapshot(main_symbols, trade_date)
                 manifest, evidence, bars = run_canonical_raw_refresh(
                     adapter,
                     request,

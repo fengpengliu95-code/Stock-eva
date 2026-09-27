@@ -897,9 +897,8 @@ def test_task8_automatic_canonical_callback_uses_real_raw_adapter_fixture(tmp_pa
         factor_cache.FACTOR_FIELDS,
         [["sh.600000", target.isoformat(), "1", "1", "1"]],
     )
-    adapter = BaoStockProviderAdapter(
-        client=_CompleteSdkClient(), max_attempts=1, min_request_interval_seconds=0
-    )
+    client = _CompleteSdkClient()
+    adapter = BaoStockProviderAdapter(client=client, max_attempts=1, min_request_interval_seconds=0)
     callback = canonical_refresh_callback(
         MarketStore(tmp_path / "market.duckdb"),
         adapter,
@@ -914,6 +913,51 @@ def test_task8_automatic_canonical_callback_uses_real_raw_adapter_fixture(tmp_pa
         run_id="fixture-refresh",
     )
     assert result.status == "ready"
+    assert sum(name == "query_daily_adjust_factor" for name, *_ in client.calls) == 1
+
+
+def test_canonical_callback_advances_stale_factor_stream_before_capture(tmp_path):
+    baseline = date(2026, 8, 19)
+    target = date(2026, 8, 20)
+    factor_cache = AdjustmentFactorCache(":memory:")
+    factor_cache.record_bootstrap(
+        "sh.600000",
+        baseline,
+        factor_cache.FACTOR_FIELDS,
+        [["sh.600000", baseline.isoformat(), "1", "1", "1"]],
+    )
+    factor_cache.record_daily_events(
+        baseline,
+        factor_cache.FACTOR_FIELDS,
+        [],
+        advance_stream=True,
+    )
+    client = _CompleteSdkClient(response_date=target.isoformat())
+    adapter = BaoStockProviderAdapter(
+        client=client,
+        factor_cache=factor_cache,
+        max_attempts=1,
+        min_request_interval_seconds=0,
+    )
+    callback = canonical_refresh_callback(
+        MarketStore(tmp_path / "market.duckdb"),
+        adapter,
+        evidence_root=tmp_path / "evidence",
+        lock_path=tmp_path / "locks" / "refresh.lock",
+        factor_cache=factor_cache,
+    )
+
+    result = callback(
+        trade_date=target,
+        required_symbols={"sh.600000"},
+        request_key="daily:stale-factor-cache",
+        run_id="stale-factor-cache-refresh",
+    )
+
+    assert result.status == "ready"
+    assert factor_cache.stream_through() == target
+    assert set(factor_cache.exact_snapshots(("sh.600000",), target)) == {"sh.600000"}
+    assert sum(name == "query_daily_adjust_factor" for name, *_ in client.calls) == 2
 
 
 def test_task8_automatic_callback_normalizes_exactly_once(tmp_path):
