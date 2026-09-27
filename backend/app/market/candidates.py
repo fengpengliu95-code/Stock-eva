@@ -1257,6 +1257,15 @@ def _row_value(row: Any, name: str, default: Any = None) -> Any:
     return getattr(row, name, default)
 
 
+def _validate_daily_factor_subset(
+    factor_symbols: tuple[str, ...], plan_stock: tuple[str, ...]
+) -> None:
+    if factor_symbols != tuple(sorted(factor_symbols)) or not set(factor_symbols).issubset(
+        plan_stock
+    ):
+        raise ValueError("daily factor universe is outside stock universe")
+
+
 def _durable_universe(
     evidence: PublishedEvidence,
     evidence_pages: tuple[dict[str, Any], ...] | None = None,
@@ -1324,8 +1333,7 @@ def _durable_universe(
 
     factor_rows = by_endpoint.get(ProviderEndpoint.DAILY_FACTOR, [])
     factor_symbols = unique_codes(factor_rows)
-    if tuple(factor_symbols) != plan_stock:
-        raise ValueError("daily factor universe does not match stock universe")
+    _validate_daily_factor_subset(factor_symbols, plan_stock)
     if any(
         str(row.get("dividOperateDate")) != evidence.manifest.trade_date.isoformat()
         for row in factor_rows

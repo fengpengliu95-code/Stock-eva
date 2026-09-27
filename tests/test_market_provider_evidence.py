@@ -20,6 +20,7 @@ from backend.app.market.automation import (
     publish_provider_evidence_with_factor_cache,
     run_canonical_raw_refresh,
 )
+from backend.app.market.candidates import _validate_daily_factor_subset
 from backend.app.market.evidence import (
     CacheFactorResolution,
     EvidenceError,
@@ -43,6 +44,17 @@ from tests.test_market_provider_contract import _CompleteSdkClient, _provider_ra
 
 def _clock() -> datetime:
     return datetime(2026, 8, 24, 12, tzinfo=UTC)
+
+
+def test_daily_factor_events_are_a_subset_but_resolution_remains_full_universe() -> None:
+    plan = ("sh.600000", "sz.000001")
+
+    _validate_daily_factor_subset((), plan)
+    _validate_daily_factor_subset(("sh.600000",), plan)
+    with pytest.raises(ValueError, match="outside stock universe"):
+        _validate_daily_factor_subset(("sz.300001",), plan)
+    with pytest.raises(ValueError, match="outside stock universe"):
+        _validate_daily_factor_subset(("sz.000001", "sh.600000"), plan)
 
 
 def _published(tmp_path: Path):

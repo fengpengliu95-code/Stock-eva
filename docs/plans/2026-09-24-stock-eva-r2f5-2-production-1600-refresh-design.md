@@ -67,6 +67,11 @@ endpoint prevents all daily-bar endpoints from being attempted.
   `(dividOperateDate, code)` before typed validation/evidence. Out-of-scope
   board rows are not candidate data. In-scope duplicates, invalid dates,
   malformed values, and missing required factor resolution remain fail-closed.
+- FR-8: Durable candidate validation MUST treat same-day factor event rows as
+  an ordered subset of the planned stock universe, including the valid empty
+  subset. Full factor coverage remains mandatory through the immutable factor
+  resolution snapshot, whose symbols MUST still equal the complete planned
+  stock universe exactly.
 - NFR-1: Observation fan-out MUST preserve fail-closed audit behavior: an
   exception from either sink aborts the operation and no canonical pointer is
   advanced.
