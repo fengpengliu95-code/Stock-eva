@@ -120,6 +120,19 @@ _RAW_BATCH_VALIDATION_CODES = {
     "nested pages require distinct request IDs": "NESTED_REQUEST_ID",
     "duplicate authoritative attempt page": "DUPLICATE_ATTEMPT_PAGE",
     "duplicate authoritative attempt projection key": "DUPLICATE_ATTEMPT_PROJECTION",
+    "raw lineage does not match request": "RAW_REQUEST_LINEAGE",
+    "raw batch does not bind to request plan": "RAW_PLAN_BINDING",
+    "raw batch role or schema does not bind to request plan": "RAW_ROLE_SCHEMA_BINDING",
+    "calendar row date is outside requested range": "CALENDAR_DATE_RANGE",
+    "raw row date does not match requested trade date": "ROW_SESSION_DATE",
+    "raw row date is outside requested range": "ROW_DATE_RANGE",
+    "daily factor event date must equal requested trade date": "FACTOR_SESSION_DATE",
+    "factor effective date is after requested trade date": "FACTOR_FUTURE_DATE",
+    "universe rows cannot satisfy index coverage": "UNIVERSE_INDEX_COLLISION",
+    "raw row symbol is outside requested session symbols": "ROW_SYMBOL_OUTSIDE_PLAN",
+    "index request contains a stock symbol": "INDEX_ROLE_SYMBOL",
+    "stock request contains an index symbol": "STOCK_ROLE_SYMBOL",
+    "raw batch does not provide required symbol coverage": "RAW_SYMBOL_COVERAGE",
 }
 
 
