@@ -61,6 +61,11 @@ endpoint prevents all daily-bar endpoints from being attempted.
   only that exact alias to the existing `adjustFactor` contract field before
   typed validation/evidence. Missing fields, reordered fields, or any other
   alias remain fail-closed; the canonical factor model and gates do not change.
+- FR-7: Because `query_daily_adjust_factor` returns all-market events, the RAW
+  adapter MUST retain only rows whose `code` is in the immutable logical
+  request's stock-symbol set before typed validation/evidence. Out-of-scope
+  board rows are not candidate data. In-scope duplicates, invalid dates,
+  malformed values, and missing required factor resolution remain fail-closed.
 - NFR-1: Observation fan-out MUST preserve fail-closed audit behavior: an
   exception from either sink aborts the operation and no canonical pointer is
   advanced.
@@ -100,6 +105,9 @@ endpoint prevents all daily-bar endpoints from being attempted.
 12. The exact observed `daily_factor` wire alias `adjustFacto` produces the
     unchanged typed `adjustFactor` field, while unknown factor schemas fail
     before evidence or canonical publication.
+13. A daily-factor response containing both requested main-board symbols and
+    other-board symbols publishes evidence only for the requested set; it does
+    not weaken the full main-board factor-resolution gate.
 
 ## API contracts
 

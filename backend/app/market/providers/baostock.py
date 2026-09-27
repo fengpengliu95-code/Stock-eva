@@ -165,6 +165,10 @@ class BaoStockProviderAdapter:
         fields, captured_pages = self._project_known_wire_schema(
             endpoint, contract.fields, fields, captured_pages
         )
+        if endpoint is TransportEndpoint.DAILY_FACTOR:
+            captured_pages = self._filter_requested_factor_rows(
+                fields, captured_pages, logical.symbols
+            )
         local = tuple(
             item for item in raw_observations[observation_start:] if item.endpoint is endpoint
         )
@@ -355,6 +359,28 @@ class BaoStockProviderAdapter:
             for attempt, page, request_id, session_id, _page_fields, rows in captured_pages
         ]
         return list(contract_fields), projected_pages
+
+    @staticmethod
+    def _filter_requested_factor_rows(fields, captured_pages, requested_symbols):
+        if "code" not in fields:
+            raise ValueError("source schema does not match endpoint contract")
+        code_position = fields.index("code")
+        expected = set(requested_symbols)
+        filtered_pages = []
+        for attempt, page, request_id, session_id, page_fields, rows in captured_pages:
+            if any(len(row) != len(fields) for row in rows):
+                raise ValueError("source schema does not match endpoint contract")
+            filtered_pages.append(
+                (
+                    attempt,
+                    page,
+                    request_id,
+                    session_id,
+                    page_fields,
+                    [row for row in rows if row[code_position] in expected],
+                )
+            )
+        return filtered_pages
 
     @staticmethod
     def _projection(item, entries, *, default_kind):

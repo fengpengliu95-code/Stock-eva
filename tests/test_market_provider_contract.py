@@ -1240,7 +1240,10 @@ def test_baostock_adapter_maps_exact_daily_factor_wire_alias() -> None:
                     "backAdjustFactor",
                     "adjustFacto",
                 ],
-                [["sh.600000", self.response_date, "1", "0.8", "0.8"]],
+                [
+                    ["sh.600000", self.response_date, "1", "0.8", "0.8"],
+                    ["sz.300001", self.response_date, "1", "0.9", "0.9"],
+                ],
             )
 
     logical = _plan(
@@ -1265,6 +1268,7 @@ def test_baostock_adapter_maps_exact_daily_factor_wire_alias() -> None:
 
     batch = raw.endpoint_batches[0]
     assert batch.fields[-1] == "adjustFactor"
+    assert batch.row_count == 1
     assert batch.rows[0].adjustFactor == 0.8
 
 
@@ -1772,7 +1776,7 @@ def test_provider_raw_batch_requires_exact_adapter_and_endpoint_contract_version
         registry.model_copy(update={"adapter_version": "r2f2.v2"})
 
 
-def test_factor_rows_require_exact_logical_symbols_and_divid_operate_date_code_sort() -> None:
+def test_daily_factor_filters_rows_outside_exact_logical_symbols() -> None:
     logical = _plan(
         endpoint=ProviderEndpoint.DAILY_FACTOR,
         role=RequestRole.DAILY_FACTOR,
@@ -1790,14 +1794,13 @@ def test_factor_rows_require_exact_logical_symbols_and_divid_operate_date_code_s
         )
 
     client.query_daily_adjust_factor = wrong_factor
-    with pytest.raises(ValueError, match="symbol"):
-        BaoStockProviderAdapter(
-            client=client, max_attempts=1, min_request_interval_seconds=0
-        ).fetch_raw(
-            _provider_request(
-                plan=_plan_container(logical), session_symbols=("sh.600000", "sh.600001")
-            )
-        )
+    raw = BaoStockProviderAdapter(
+        client=client, max_attempts=1, min_request_interval_seconds=0
+    ).fetch_raw(
+        _provider_request(plan=_plan_container(logical), session_symbols=("sh.600000", "sh.600001"))
+    )
+
+    assert raw.endpoint_batches[0].row_count == 0
 
 
 def test_daily_factor_event_date_equals_requested_session_and_rejects_older_or_future() -> None:
