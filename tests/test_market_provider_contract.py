@@ -1314,6 +1314,39 @@ def test_baostock_adapter_filters_all_stock_to_active_main_board() -> None:
     )
 
 
+def test_baostock_adapter_filters_daily_astock_to_planned_symbols() -> None:
+    class MixedDailyClient(_CompleteSdkClient):
+        def query_daily_history_k_AStock(self, **kwargs):
+            self._record("query_daily_history_k_AStock", kwargs)
+            return _SdkResult(
+                DAILY_FIELDS.split(","),
+                [
+                    self._daily_row("sz.300001"),
+                    self._daily_row("sz.000001"),
+                    self._daily_row("sh.600000"),
+                ],
+            )
+
+    logical = _plan(symbols=("sh.600000", "sz.000001"))
+    adapter = BaoStockProviderAdapter(
+        client=MixedDailyClient(),
+        max_attempts=1,
+        min_request_interval_seconds=0,
+    )
+
+    raw = adapter.fetch_raw(
+        _provider_request(
+            plan=_plan_container(logical),
+            session_symbols=("sh.600000", "sz.000001"),
+        )
+    )
+
+    assert tuple(row.code for row in raw.endpoint_batches[0].rows) == (
+        "sh.600000",
+        "sz.000001",
+    )
+
+
 def test_raw_batch_validation_diagnostic_is_allowlisted() -> None:
     assert (
         _raw_batch_validation_code(ValueError("successful completion row count mismatch"))

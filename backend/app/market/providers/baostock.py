@@ -301,6 +301,10 @@ class BaoStockProviderAdapter:
         )
         if endpoint is TransportEndpoint.ALL_STOCK:
             captured_pages = self._filter_active_main_board_rows(fields, captured_pages)
+        if endpoint is TransportEndpoint.DAILY_ASTOCK:
+            captured_pages = self._filter_requested_daily_rows(
+                fields, captured_pages, logical.symbols
+            )
         if endpoint is TransportEndpoint.DAILY_FACTOR:
             captured_pages = self._filter_requested_factor_rows(
                 fields, captured_pages, logical.symbols
@@ -482,6 +486,32 @@ class BaoStockProviderAdapter:
                         for row in sorted(rows, key=lambda item: item[code_position])
                         if _is_main_board(row[code_position]) and row[status_position] == "1"
                     ],
+                )
+            )
+        return filtered_pages
+
+    @staticmethod
+    def _filter_requested_daily_rows(fields, captured_pages, requested_symbols):
+        if "code" not in fields or "date" not in fields:
+            raise ValueError("source schema does not match endpoint contract")
+        code_position = fields.index("code")
+        date_position = fields.index("date")
+        expected = set(requested_symbols)
+        filtered_pages = []
+        for attempt, page, request_id, session_id, page_fields, rows in captured_pages:
+            if any(len(row) != len(fields) for row in rows):
+                raise ValueError("source schema does not match endpoint contract")
+            filtered_pages.append(
+                (
+                    attempt,
+                    page,
+                    request_id,
+                    session_id,
+                    page_fields,
+                    sorted(
+                        (row for row in rows if row[code_position] in expected),
+                        key=lambda row: (row[date_position], row[code_position]),
+                    ),
                 )
             )
         return filtered_pages

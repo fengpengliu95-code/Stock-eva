@@ -87,6 +87,10 @@ endpoint prevents all daily-bar endpoints from being attempted.
   complete logical request, not every individual page, owns the non-empty
   universe requirement. All retained pages are combined for exact plan
   equality validation.
+- FR-10a: BaoStock `daily_astock` is also an all-market transport result. The
+  RAW adapter MUST retain only symbols in the immutable daily-stock logical
+  request and sort retained rows by `(date, code)` before typed validation.
+  Missing planned symbols, duplicates, and invalid dates remain fail-closed.
 - FR-11: Canonical refresh failures MUST emit a fixed, payload-free diagnostic
   phase and normalized error kind. The diagnostic MUST distinguish RAW fetch,
   RAW validation, factor evidence capture, normalization, gate evaluation,
@@ -145,6 +149,8 @@ endpoint prevents all daily-bar endpoints from being attempted.
     a zero-request fast path.
 15. Mixed-board `all_stock` fixtures retain only active main-board rows before
     evidence; inactive and other-board rows cannot enter the canonical universe.
+15a. Mixed-board `daily_astock` fixtures retain only planned symbols and still
+     require exact planned-symbol coverage.
 16. A phase-specific failure logs only its fixed phase and normalized error
     kind; a secret-bearing exception message is absent from logs and results.
 
