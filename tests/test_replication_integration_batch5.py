@@ -72,6 +72,33 @@ def test_disabled_replication_still_seals_local_publication_binding(tmp_path) ->
     assert not (tmp_path / "control" / "replication").exists()
 
 
+def test_canonical_publication_retains_existing_legacy_lineage_mode(tmp_path) -> None:
+    root = _dataset(tmp_path)
+    store = NasMarketStore(
+        MarketStore(tmp_path / "control" / "market.duckdb"),
+        root,
+        tmp_path / "staging",
+        replication_enabled=False,
+    )
+    store.save_refresh(_bars(), _ready_result(), publish=True, lineage_input={"mode": "legacy"})
+
+    selected = store.canonical_lineage_input(
+        {
+            "provider_id": "baostock",
+            "universe_id": "all-main-board",
+            "evidence_id": "ev-1",
+            "evidence_sha256": "a" * 64,
+            "candidate_id": "candidate-1",
+            "candidate_manifest_sha256": "b" * 64,
+            "gate_report_sha256": "c" * 64,
+            "adapter_version": "r2f2.v1",
+            "source_schema_version": "daily_astock.v1",
+        }
+    )
+
+    assert selected == LineageInput(mode="legacy")
+
+
 def test_source_commit_uses_exact_immutable_source_instance_or_is_optional(tmp_path) -> None:
     root = _dataset(tmp_path)
     source = SourceInstanceStore(root / "_replication" / "source-instance.json").create(

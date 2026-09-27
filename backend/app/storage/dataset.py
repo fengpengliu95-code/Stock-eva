@@ -1994,6 +1994,16 @@ class NasMarketStore:
         else:
             self.control.save_refresh([], result, publish=False)
 
+    def canonical_lineage_input(
+        self,
+        publication_lineage: dict[str, object],
+    ) -> LineageInput:
+        """Select the explicit lineage mode without permitting manifest mixing."""
+        existing_mode = self.coordinator._existing_lineage_mode(self._manifest())
+        if existing_mode == "legacy":
+            return LineageInput(mode="legacy")
+        return LineageInput.model_validate({"mode": "modern", "exact": publication_lineage})
+
     def export_date(self, trade_date, output_root: Path, source: str = "baostock") -> Path:
         """Export a published partition locally without modifying the NAS dataset."""
         self._ensure_writable()

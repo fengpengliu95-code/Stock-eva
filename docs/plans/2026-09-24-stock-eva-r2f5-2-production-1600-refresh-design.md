@@ -105,6 +105,11 @@ endpoint prevents all daily-bar endpoints from being attempted.
   Pydantic failures may additionally expose only their fixed error `type` and
   field/index `loc`; `input`, `ctx`, URL, message, and exception text are
   excluded.
+- FR-12: Canonical publication MUST read the existing immutable manifest
+  lineage mode before mutation. A legacy generation receives an explicit
+  `LineageInput(mode="legacy")`; an empty or modern generation receives exact
+  retained-evidence modern lineage. Mixed lineage remains prohibited and the
+  existing manifest is never rewritten merely to admit a new session.
 - NFR-1: Observation fan-out MUST preserve fail-closed audit behavior: an
   exception from either sink aborts the operation and no canonical pointer is
   advanced.

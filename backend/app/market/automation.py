@@ -2013,13 +2013,15 @@ def canonical_refresh_callback(
                         "source_schema_version": candidate.source_schema_version,
                     }
                     set_diagnostic_phase("canonical_publication")
-                    store.save_refresh(
-                        normalized.bars,
-                        result,
-                        publish=True,
-                        publication_lineage=publication_lineage,
-                        selection=published_selection,
-                    )
+                    save_kwargs = {
+                        "publish": True,
+                        "publication_lineage": publication_lineage,
+                        "selection": published_selection,
+                    }
+                    lineage_input = getattr(store, "canonical_lineage_input", None)
+                    if callable(lineage_input):
+                        save_kwargs["lineage_input"] = lineage_input(publication_lineage)
+                    store.save_refresh(normalized.bars, result, **save_kwargs)
                     try:
                         from backend.app.market.universe import canonical_json_bytes, domain_sha256
 
