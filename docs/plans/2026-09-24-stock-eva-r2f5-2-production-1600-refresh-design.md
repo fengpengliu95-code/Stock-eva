@@ -83,6 +83,10 @@ endpoint prevents all daily-bar endpoints from being attempted.
   with `tradeStatus=1`, preserving provider order, before typed evidence and
   universe equality validation. Unknown symbols, duplicate retained symbols,
   or malformed status fields remain fail-closed.
+  A filtered transport page may be empty and MUST retain its page lineage; the
+  complete logical request, not every individual page, owns the non-empty
+  universe requirement. All retained pages are combined for exact plan
+  equality validation.
 - FR-11: Canonical refresh failures MUST emit a fixed, payload-free diagnostic
   phase and normalized error kind. The diagnostic MUST distinguish RAW fetch,
   RAW validation, factor evidence capture, normalization, gate evaluation,

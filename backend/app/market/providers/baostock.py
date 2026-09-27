@@ -367,7 +367,7 @@ class BaoStockProviderAdapter:
                     page_fields,
                     [
                         row
-                        for row in rows
+                        for row in sorted(rows, key=lambda item: item[code_position])
                         if _is_main_board(row[code_position]) and row[status_position] == "1"
                     ],
                 )

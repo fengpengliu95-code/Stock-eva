@@ -722,8 +722,6 @@ class RawEndpointBatch(_ContractModel):
             if row.endpoint is not self.endpoint or row.schema_variant != self.schema_variant:
                 raise ValueError("mixed endpoint rows")
         if self.endpoint is ProviderEndpoint.ALL_STOCK:
-            if not self.rows:
-                raise ValueError("universe coverage cannot be empty")
             codes = tuple(row.code for row in self.rows)
             if codes != tuple(sorted(set(codes))):
                 raise ValueError("universe rows must be unique and ordered")
@@ -1139,6 +1137,10 @@ class ProviderRawBatch(_ContractModel):
                 continue
             if not batches or completion.successful_root_request_id is None:
                 raise ValueError("successful completion requires source batch")
+            if logical.endpoint is ProviderEndpoint.ALL_STOCK and not any(
+                item.rows for item in batches
+            ):
+                raise ValueError("universe coverage cannot be empty")
             if any(
                 item.lineage.attempt != completion.successful_attempt
                 or item.lineage.plan_ordinal != completion.plan_ordinal

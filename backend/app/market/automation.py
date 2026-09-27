@@ -1843,9 +1843,9 @@ def canonical_refresh_callback(
                 for item in batch.endpoint_batches
                 if item.endpoint is ContractProviderEndpoint.ALL_STOCK
             )
-            if len(universe) != 1:
+            if not universe:
                 raise ProviderHealthError("canonical universe page is missing")
-            actual = tuple(row.code for row in universe[0].rows)
+            actual = tuple(row.code for page in universe for row in page.rows)
             if actual != main_symbols:
                 raise ProviderHealthError("canonical universe changed during raw refresh")
 
