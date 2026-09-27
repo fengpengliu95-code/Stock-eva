@@ -1274,6 +1274,41 @@ def test_baostock_adapter_maps_exact_daily_factor_wire_alias() -> None:
     assert batch.rows[0].adjustFactor == 0.8
 
 
+def test_baostock_adapter_filters_all_stock_to_active_main_board() -> None:
+    class MixedUniverseClient(_CompleteSdkClient):
+        def query_all_stock(self, **kwargs):
+            self._record("query_all_stock", kwargs)
+            return _SdkResult(
+                ["code", "tradeStatus", "code_name"],
+                [
+                    ["sh.600000", "1", "kept-sh"],
+                    ["sh.688001", "1", "star"],
+                    ["sz.000001", "0", "inactive"],
+                    ["sz.300001", "1", "chinext"],
+                    ["sz.002001", "1", "kept-sz"],
+                ],
+            )
+
+    logical = _plan(
+        endpoint=ProviderEndpoint.ALL_STOCK,
+        role=RequestRole.UNIVERSE,
+        variant="all_stock.market.v1",
+        symbols=(),
+    )
+    adapter = BaoStockProviderAdapter(
+        client=MixedUniverseClient(),
+        max_attempts=1,
+        min_request_interval_seconds=0,
+    )
+
+    raw = adapter.fetch_raw(_provider_request(plan=_plan_container(logical)))
+
+    assert tuple(row.code for row in raw.endpoint_batches[0].rows) == (
+        "sh.600000",
+        "sz.002001",
+    )
+
+
 def test_baostock_adapter_publishes_one_source_batch_per_final_success_page() -> None:
     client = _TwoPageRetrySdkClient()
     adapter = BaoStockProviderAdapter(client=client, max_attempts=2, min_request_interval_seconds=0)

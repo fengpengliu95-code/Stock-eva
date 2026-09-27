@@ -7,7 +7,7 @@ from collections.abc import Sequence
 from datetime import UTC, date, datetime
 from hashlib import sha256
 
-from backend.app.market.baostock import DAILY_FIELDS, capture_registry
+from backend.app.market.baostock import DAILY_FIELDS, _is_main_board, capture_registry
 from backend.app.market.baostock import BaoStockProvider as IncumbentBaoStockProvider
 from backend.app.market.baostock_vendor import transport_observation_sink
 from backend.app.market.models import DailyBar
@@ -187,6 +187,8 @@ class BaoStockProviderAdapter:
         fields, captured_pages = self._project_known_wire_schema(
             endpoint, contract.fields, fields, captured_pages
         )
+        if endpoint is TransportEndpoint.ALL_STOCK:
+            captured_pages = self._filter_active_main_board_rows(fields, captured_pages)
         if endpoint is TransportEndpoint.DAILY_FACTOR:
             captured_pages = self._filter_requested_factor_rows(
                 fields, captured_pages, logical.symbols
@@ -345,6 +347,32 @@ class BaoStockProviderAdapter:
             row_count=sum(page.row_count for page in endpoint_batches),
         )
         return endpoint_batches, completion, page_lineages, local_projections, summary
+
+    @staticmethod
+    def _filter_active_main_board_rows(fields, captured_pages):
+        if tuple(fields) != ("code", "tradeStatus", "code_name"):
+            raise ValueError("source schema does not match endpoint contract")
+        code_position = fields.index("code")
+        status_position = fields.index("tradeStatus")
+        filtered_pages = []
+        for attempt, page, request_id, session_id, page_fields, rows in captured_pages:
+            if any(len(row) != len(fields) for row in rows):
+                raise ValueError("source schema does not match endpoint contract")
+            filtered_pages.append(
+                (
+                    attempt,
+                    page,
+                    request_id,
+                    session_id,
+                    page_fields,
+                    [
+                        row
+                        for row in rows
+                        if _is_main_board(row[code_position]) and row[status_position] == "1"
+                    ],
+                )
+            )
+        return filtered_pages
 
     @staticmethod
     def _project_known_wire_schema(endpoint, contract_fields, fields, captured_pages):

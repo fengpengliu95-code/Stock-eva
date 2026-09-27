@@ -78,6 +78,11 @@ endpoint prevents all daily-bar endpoints from being attempted.
   through every intervening trading session and materialize the target
   snapshot; a partial stream or incomplete snapshot fails closed. An already
   complete exact snapshot MUST not cause extra provider requests.
+- FR-10: The BaoStock `all_stock` response is an all-market transport result.
+  The RAW adapter MUST retain only known Shanghai/Shenzhen main-board prefixes
+  with `tradeStatus=1`, preserving provider order, before typed evidence and
+  universe equality validation. Unknown symbols, duplicate retained symbols,
+  or malformed status fields remain fail-closed.
 - NFR-1: Observation fan-out MUST preserve fail-closed audit behavior: an
   exception from either sink aborts the operation and no canonical pointer is
   advanced.
@@ -123,6 +128,8 @@ endpoint prevents all daily-bar endpoints from being attempted.
 14. A stale but contiguous factor cache is advanced through the target session
     before evidence capture, while an already complete target snapshot remains
     a zero-request fast path.
+15. Mixed-board `all_stock` fixtures retain only active main-board rows before
+    evidence; inactive and other-board rows cannot enter the canonical universe.
 
 ## API contracts
 
