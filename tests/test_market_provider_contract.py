@@ -28,7 +28,10 @@ from backend.app.market.provider_transport import (
     ProviderEndpoint as TransportEndpoint,
 )
 from backend.app.market.providers import base as provider_base
-from backend.app.market.providers.baostock import BaoStockProviderAdapter
+from backend.app.market.providers.baostock import (
+    BaoStockProviderAdapter,
+    _raw_batch_validation_code,
+)
 from backend.app.market.providers.base import (
     ENDPOINT_CONTRACTS,
     AttemptCompletion,
@@ -1306,6 +1309,17 @@ def test_baostock_adapter_filters_all_stock_to_active_main_board() -> None:
     assert tuple(row.code for row in raw.endpoint_batches[0].rows) == (
         "sh.600000",
         "sz.002001",
+    )
+
+
+def test_raw_batch_validation_diagnostic_is_allowlisted() -> None:
+    assert (
+        _raw_batch_validation_code(ValueError("successful completion row count mismatch"))
+        == "ROW_COUNT_MISMATCH"
+    )
+    assert (
+        _raw_batch_validation_code(ValueError("token=secret /private/raw-payload"))
+        == "UNKNOWN_RAW_BATCH_VALIDATION"
     )
 
 

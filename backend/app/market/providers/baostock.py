@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from collections.abc import Sequence
 from datetime import UTC, date, datetime
 from hashlib import sha256
@@ -54,6 +55,26 @@ _DAILY_FACTOR_WIRE_FIELDS = (
     "backAdjustFactor",
     "adjustFacto",
 )
+
+_RAW_BATCH_VALIDATION_CODES = {
+    "raw endpoint batches must be ordered by plan and page": "BATCH_ORDER",
+    "raw endpoint summaries do not bind source batches": "SUMMARY_BINDING",
+    "source batch pages do not bind completion": "PAGE_COMPLETION_BINDING",
+    "successful completion row count mismatch": "ROW_COUNT_MISMATCH",
+    "transport lineage does not exactly match successful pages": "LINEAGE_PAGE_MISMATCH",
+    "raw endpoint batches do not exactly match successful pages": "BATCH_PAGE_MISMATCH",
+    "successful COMPLETE projections do not exactly match pages": "PROJECTION_PAGE_MISMATCH",
+    "successful page lineage joins are not exact": "LINEAGE_JOIN_MISMATCH",
+    "completion hash mismatch": "COMPLETION_HASH_MISMATCH",
+}
+
+
+def _raw_batch_validation_code(error: Exception) -> str:
+    rendered = str(error)
+    for message, code in _RAW_BATCH_VALIDATION_CODES.items():
+        if message in rendered:
+            return code
+    return "UNKNOWN_RAW_BATCH_VALIDATION"
 
 
 class BaoStockProviderAdapter:
@@ -141,25 +162,32 @@ class BaoStockProviderAdapter:
                 separators=(",", ":"),
             ).encode()
         ).hexdigest()
-        batch = ProviderRawBatch(
-            provider_id=ProviderId.BAOSTOCK,
-            request=request,
-            adapter_version=self.adapter_version,
-            endpoint_contract_version=self.endpoint_contract_version,
-            started_at=started_at,
-            completed_at=completed_at,
-            normalization_clock_utc=completed_at,
-            logical_request_plan=request.logical_request_plan,
-            request_plan_hash=request.logical_request_plan.request_plan_hash,
-            endpoint_batches=tuple(endpoint_batches),
-            request_completions=tuple(completions),
-            completion_hash=completion_hash,
-            transport_lineage=tuple(lineages),
-            transport_observations=TransportObservationAggregate.from_observations(
-                login_projections + tuple(projections)
-            ),
-            endpoint_summaries=tuple(summaries),
-        )
+        try:
+            batch = ProviderRawBatch(
+                provider_id=ProviderId.BAOSTOCK,
+                request=request,
+                adapter_version=self.adapter_version,
+                endpoint_contract_version=self.endpoint_contract_version,
+                started_at=started_at,
+                completed_at=completed_at,
+                normalization_clock_utc=completed_at,
+                logical_request_plan=request.logical_request_plan,
+                request_plan_hash=request.logical_request_plan.request_plan_hash,
+                endpoint_batches=tuple(endpoint_batches),
+                request_completions=tuple(completions),
+                completion_hash=completion_hash,
+                transport_lineage=tuple(lineages),
+                transport_observations=TransportObservationAggregate.from_observations(
+                    login_projections + tuple(projections)
+                ),
+                endpoint_summaries=tuple(summaries),
+            )
+        except (TypeError, ValueError) as error:
+            logging.getLogger(__name__).error(
+                "baostock_raw_batch_validation_failed code=%s",
+                _raw_batch_validation_code(error),
+            )
+            raise
         for endpoint_batch in batch.endpoint_batches:
             validate_raw_date_binding(request, endpoint_batch)
         return batch

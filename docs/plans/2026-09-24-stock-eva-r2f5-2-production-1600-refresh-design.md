@@ -92,6 +92,9 @@ endpoint prevents all daily-bar endpoints from being attempted.
   RAW validation, factor evidence capture, normalization, gate evaluation,
   candidate publication, and canonical publication without logging exception
   messages, payloads, paths, URLs, tokens, or provider response bodies.
+  ProviderRawBatch aggregation failures additionally use an explicit allowlist
+  of fixed reason codes; unmatched exception text maps to
+  `UNKNOWN_RAW_BATCH_VALIDATION` and is never emitted.
 - NFR-1: Observation fan-out MUST preserve fail-closed audit behavior: an
   exception from either sink aborts the operation and no canonical pointer is
   advanced.
