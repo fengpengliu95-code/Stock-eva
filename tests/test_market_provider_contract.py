@@ -14,6 +14,7 @@ from time import monotonic
 from typing import Any
 
 import pytest
+from pydantic import ValidationError
 
 from backend.app.market.baostock import DAILY_FIELDS
 from backend.app.market.baostock_vendor import emit_terminal_observation
@@ -31,6 +32,7 @@ from backend.app.market.providers import base as provider_base
 from backend.app.market.providers.baostock import (
     BaoStockProviderAdapter,
     _raw_batch_validation_code,
+    _raw_batch_validation_signature,
 )
 from backend.app.market.providers.base import (
     ENDPOINT_CONTRACTS,
@@ -1321,6 +1323,16 @@ def test_raw_batch_validation_diagnostic_is_allowlisted() -> None:
         _raw_batch_validation_code(ValueError("token=secret /private/raw-payload"))
         == "UNKNOWN_RAW_BATCH_VALIDATION"
     )
+
+
+def test_raw_batch_validation_signature_omits_pydantic_input_and_context() -> None:
+    secret = "token=secret /private/raw-payload"
+    with pytest.raises(ValidationError) as caught:
+        _provider_request(universe_id=secret)
+
+    signature = _raw_batch_validation_signature(caught.value)
+    assert signature
+    assert secret not in json.dumps(signature)
 
 
 def test_baostock_adapter_publishes_one_source_batch_per_final_success_page() -> None:

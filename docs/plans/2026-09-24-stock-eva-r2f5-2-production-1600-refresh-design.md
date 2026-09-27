@@ -95,6 +95,9 @@ endpoint prevents all daily-bar endpoints from being attempted.
   ProviderRawBatch aggregation failures additionally use an explicit allowlist
   of fixed reason codes; unmatched exception text maps to
   `UNKNOWN_RAW_BATCH_VALIDATION` and is never emitted.
+  Pydantic failures may additionally expose only their fixed error `type` and
+  field/index `loc`; `input`, `ctx`, URL, message, and exception text are
+  excluded.
 - NFR-1: Observation fan-out MUST preserve fail-closed audit behavior: an
   exception from either sink aborts the operation and no canonical pointer is
   advanced.

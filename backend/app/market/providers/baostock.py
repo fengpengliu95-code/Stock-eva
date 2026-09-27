@@ -8,6 +8,8 @@ from collections.abc import Sequence
 from datetime import UTC, date, datetime
 from hashlib import sha256
 
+from pydantic import ValidationError
+
 from backend.app.market.baostock import DAILY_FIELDS, _is_main_board, capture_registry
 from backend.app.market.baostock import BaoStockProvider as IncumbentBaoStockProvider
 from backend.app.market.baostock_vendor import transport_observation_sink
@@ -92,6 +94,22 @@ def _raw_batch_validation_code(error: Exception) -> str:
         if message in rendered:
             return code
     return "UNKNOWN_RAW_BATCH_VALIDATION"
+
+
+def _raw_batch_validation_signature(error: Exception) -> list[dict[str, object]]:
+    if not isinstance(error, ValidationError):
+        return []
+    return [
+        {
+            "type": str(item.get("type", "unknown")),
+            "loc": [str(part) for part in item.get("loc", ())],
+        }
+        for item in error.errors(
+            include_url=False,
+            include_context=False,
+            include_input=False,
+        )[:3]
+    ]
 
 
 class BaoStockProviderAdapter:
@@ -201,8 +219,9 @@ class BaoStockProviderAdapter:
             )
         except (TypeError, ValueError) as error:
             logging.getLogger(__name__).error(
-                "baostock_raw_batch_validation_failed code=%s",
+                "baostock_raw_batch_validation_failed code=%s signature=%s",
                 _raw_batch_validation_code(error),
+                json.dumps(_raw_batch_validation_signature(error), sort_keys=True),
             )
             raise
         for endpoint_batch in batch.endpoint_batches:
