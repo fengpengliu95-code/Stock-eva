@@ -63,7 +63,8 @@ endpoint prevents all daily-bar endpoints from being attempted.
   alias remain fail-closed; the canonical factor model and gates do not change.
 - FR-7: Because `query_daily_adjust_factor` returns all-market events, the RAW
   adapter MUST retain only rows whose `code` is in the immutable logical
-  request's stock-symbol set before typed validation/evidence. Out-of-scope
+  request's stock-symbol set and deterministically order retained rows by
+  `(dividOperateDate, code)` before typed validation/evidence. Out-of-scope
   board rows are not candidate data. In-scope duplicates, invalid dates,
   malformed values, and missing required factor resolution remain fail-closed.
 - NFR-1: Observation fan-out MUST preserve fail-closed audit behavior: an

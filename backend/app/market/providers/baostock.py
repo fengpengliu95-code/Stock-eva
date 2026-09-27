@@ -362,9 +362,10 @@ class BaoStockProviderAdapter:
 
     @staticmethod
     def _filter_requested_factor_rows(fields, captured_pages, requested_symbols):
-        if "code" not in fields:
+        if "code" not in fields or "dividOperateDate" not in fields:
             raise ValueError("source schema does not match endpoint contract")
         code_position = fields.index("code")
+        date_position = fields.index("dividOperateDate")
         expected = set(requested_symbols)
         filtered_pages = []
         for attempt, page, request_id, session_id, page_fields, rows in captured_pages:
@@ -377,7 +378,10 @@ class BaoStockProviderAdapter:
                     request_id,
                     session_id,
                     page_fields,
-                    [row for row in rows if row[code_position] in expected],
+                    sorted(
+                        (row for row in rows if row[code_position] in expected),
+                        key=lambda row: (row[date_position], row[code_position]),
+                    ),
                 )
             )
         return filtered_pages

@@ -1241,8 +1241,9 @@ def test_baostock_adapter_maps_exact_daily_factor_wire_alias() -> None:
                     "adjustFacto",
                 ],
                 [
-                    ["sh.600000", self.response_date, "1", "0.8", "0.8"],
+                    ["sz.000001", self.response_date, "1", "0.7", "0.7"],
                     ["sz.300001", self.response_date, "1", "0.9", "0.9"],
+                    ["sh.600000", self.response_date, "1", "0.8", "0.8"],
                 ],
             )
 
@@ -1251,7 +1252,7 @@ def test_baostock_adapter_maps_exact_daily_factor_wire_alias() -> None:
         role=RequestRole.DAILY_FACTOR,
         instrument=InstrumentRole.STOCK,
         variant="daily_factor.v1",
-        symbols=("sh.600000",),
+        symbols=("sh.600000", "sz.000001"),
     )
     adapter = BaoStockProviderAdapter(
         client=DailyFactorAliasClient(),
@@ -1262,13 +1263,14 @@ def test_baostock_adapter_maps_exact_daily_factor_wire_alias() -> None:
     raw = adapter.fetch_raw(
         _provider_request(
             plan=_plan_container(logical),
-            session_symbols=("sh.600000",),
+            session_symbols=("sh.600000", "sz.000001"),
         )
     )
 
     batch = raw.endpoint_batches[0]
     assert batch.fields[-1] == "adjustFactor"
-    assert batch.row_count == 1
+    assert batch.row_count == 2
+    assert tuple(row.code for row in batch.rows) == ("sh.600000", "sz.000001")
     assert batch.rows[0].adjustFactor == 0.8
 
 
