@@ -960,6 +960,44 @@ def test_canonical_callback_advances_stale_factor_stream_before_capture(tmp_path
     assert sum(name == "query_daily_adjust_factor" for name, *_ in client.calls) == 2
 
 
+def test_canonical_callback_logs_only_safe_failure_phase(tmp_path, caplog):
+    secret = "token=secret /private/raw-payload"
+    target = date(2026, 8, 20)
+    factor_cache = AdjustmentFactorCache(":memory:")
+    factor_cache.record_bootstrap(
+        "sh.600000",
+        target,
+        factor_cache.FACTOR_FIELDS,
+        [["sh.600000", target.isoformat(), "1", "1", "1"]],
+    )
+    adapter = BaoStockProviderAdapter(
+        client=_CompleteSdkClient(),
+        max_attempts=1,
+        min_request_interval_seconds=0,
+    )
+    adapter.factor_cache = factor_cache
+    adapter.fetch_raw = lambda _request: (_ for _ in ()).throw(ValueError(secret))
+    callback = canonical_refresh_callback(
+        MarketStore(tmp_path / "market.duckdb"),
+        adapter,
+        evidence_root=tmp_path / "evidence",
+        lock_path=tmp_path / "locks" / "refresh.lock",
+        factor_cache=factor_cache,
+    )
+
+    result = callback(
+        trade_date=target,
+        required_symbols={"sh.600000"},
+        request_key="daily:safe-diagnostic",
+        run_id="safe-diagnostic-refresh",
+    )
+
+    assert result.status == "error"
+    assert '"phase": "raw_fetch"' in caplog.text
+    assert '"error_kind": "validation"' in caplog.text
+    assert secret not in caplog.text
+
+
 def test_task8_automatic_callback_normalizes_exactly_once(tmp_path):
     target = date(2026, 8, 20)
     factor_cache = AdjustmentFactorCache(":memory:")

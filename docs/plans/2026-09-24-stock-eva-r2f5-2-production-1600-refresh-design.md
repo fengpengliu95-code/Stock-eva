@@ -83,6 +83,11 @@ endpoint prevents all daily-bar endpoints from being attempted.
   with `tradeStatus=1`, preserving provider order, before typed evidence and
   universe equality validation. Unknown symbols, duplicate retained symbols,
   or malformed status fields remain fail-closed.
+- FR-11: Canonical refresh failures MUST emit a fixed, payload-free diagnostic
+  phase and normalized error kind. The diagnostic MUST distinguish RAW fetch,
+  RAW validation, factor evidence capture, normalization, gate evaluation,
+  candidate publication, and canonical publication without logging exception
+  messages, payloads, paths, URLs, tokens, or provider response bodies.
 - NFR-1: Observation fan-out MUST preserve fail-closed audit behavior: an
   exception from either sink aborts the operation and no canonical pointer is
   advanced.
@@ -130,6 +135,8 @@ endpoint prevents all daily-bar endpoints from being attempted.
     a zero-request fast path.
 15. Mixed-board `all_stock` fixtures retain only active main-board rows before
     evidence; inactive and other-board rows cannot enter the canonical universe.
+16. A phase-specific failure logs only its fixed phase and normalized error
+    kind; a secret-bearing exception message is absent from logs and results.
 
 ## API contracts
 

@@ -1561,6 +1561,7 @@ def run_canonical_raw_refresh(
     factor_resolution_factory: Callable[[object, object], tuple] | None = None,
     _lock_held: bool = False,
     validate_batch: Callable[[object], None] | None = None,
+    phase_sink: Callable[[str], None] | None = None,
 ) -> tuple[EvidenceManifest, PublishedEvidence, tuple[object, ...]]:
     """Run the explicit evidence-first compatibility seam for a raw refresh.
 
@@ -1577,12 +1578,18 @@ def run_canonical_raw_refresh(
         raise ProviderHealthError("canonical raw refresh requires raw provider contract")
     lock_context = nullcontext() if _lock_held else RefreshRunLock(lock_path)
     with lock_context:
+        if phase_sink is not None:
+            phase_sink("raw_fetch")
         batch = fetch_raw(request)
         if validate_batch is not None:
+            if phase_sink is not None:
+                phase_sink("raw_validation")
             validate_batch(batch)
         if factor_cache is not None:
             if not factor_symbols or trade_date is None:
                 raise ProviderHealthError("canonical factor capture requires symbols and date")
+            if phase_sink is not None:
+                phase_sink("factor_evidence_capture")
             manifest, evidence = publish_provider_evidence_with_factor_cache(
                 batch,
                 evidence_root=evidence_root,
@@ -1595,10 +1602,14 @@ def run_canonical_raw_refresh(
                 _lock_held=True,
             )
         else:
+            if phase_sink is not None:
+                phase_sink("raw_evidence_capture")
             manifest, evidence = publish_provider_evidence(
                 batch,
                 evidence_root=evidence_root,
             )
+        if phase_sink is not None:
+            phase_sink("normalization")
         normalized = adapter.normalize(
             evidence,
             normalization_clock_utc=manifest.normalization_clock_utc,
@@ -1763,6 +1774,12 @@ def canonical_refresh_callback(
         builder_outcome: Literal["accepted", "rejected"] = "rejected"
         builder_diagnostic: LegacyBuilderDiagnostic | None = None
         legacy_shadow_observation: LegacyShadowObservation | None = None
+        diagnostic_phase = "preflight"
+
+        def set_diagnostic_phase(value: str) -> None:
+            nonlocal diagnostic_phase
+            diagnostic_phase = value
+
         try:
             with adapter_scope():
                 inspection = inspect_legacy_main_board_input(adapter, trade_date)
@@ -1878,6 +1895,7 @@ def canonical_refresh_callback(
         with adapter_scope():
             try:
                 if adapter.factor_cache is factor_cache:
+                    set_diagnostic_phase("factor_snapshot_prepare")
                     adapter.ensure_factor_snapshot(main_symbols, trade_date)
                 manifest, evidence, bars = run_canonical_raw_refresh(
                     adapter,
@@ -1889,10 +1907,12 @@ def canonical_refresh_callback(
                     trade_date=trade_date,
                     factor_resolution_factory=factor_bindings,
                     validate_batch=validate_universe,
+                    phase_sink=set_diagnostic_phase,
                     _lock_held=True,
                 )
                 published_selection = None
                 try:
+                    set_diagnostic_phase("candidate_normalization")
                     normalized = ProviderBatch(
                         bars=list(bars),
                         expected_symbols=list(request.session_symbols),
@@ -1900,6 +1920,7 @@ def canonical_refresh_callback(
                     )
                     if before_store is not None:
                         before_store()
+                    set_diagnostic_phase("gate_evaluation")
                     gate_report = evaluate_candidate_gates(
                         candidate_id=f"candidate-{manifest.evidence_id[3:]}",
                         trade_date=trade_date,
@@ -1919,6 +1940,7 @@ def canonical_refresh_callback(
                         separators=(",", ":"),
                     ).encode("utf-8")
                     normalized_hash = hashlib.sha256(normalized_payload).hexdigest()
+                    set_diagnostic_phase("candidate_manifest")
                     candidate = build_candidate_manifest(
                         candidate_id=f"candidate-{manifest.evidence_id[3:]}",
                         trade_date=trade_date,
@@ -1943,6 +1965,7 @@ def canonical_refresh_callback(
                     )
                     selection = None
                     if candidate.status == "accepted":
+                        set_diagnostic_phase("candidate_selection")
                         selection = select_primary_candidate(
                             trade_date=trade_date,
                             universe_id=manifest.universe_id,
@@ -1951,6 +1974,7 @@ def canonical_refresh_callback(
                             gate_report=gate_report,
                             evidence=evidence,
                         )
+                    set_diagnostic_phase("candidate_publication")
                     published_selection = CandidateStore(evidence_root).publish_chain(
                         report=gate_report,
                         candidate=candidate,
@@ -1988,6 +2012,7 @@ def canonical_refresh_callback(
                         "adapter_version": candidate.adapter_version,
                         "source_schema_version": candidate.source_schema_version,
                     }
+                    set_diagnostic_phase("canonical_publication")
                     store.save_refresh(
                         normalized.bars,
                         result,
@@ -2052,6 +2077,19 @@ def canonical_refresh_callback(
                         published_selection.close()
                     evidence.close()
             except Exception as error:
+                error_kind = (
+                    "provider_health"
+                    if isinstance(error, ProviderHealthError)
+                    else "validation"
+                    if isinstance(error, (TypeError, ValueError))
+                    else "internal"
+                )
+                _log_event(
+                    logging.ERROR,
+                    "canonical_refresh_failed",
+                    phase=diagnostic_phase,
+                    error_kind=error_kind,
+                )
                 return CanonicalRefreshExecution(
                     result=failure_result(error),
                     builder_outcome=builder_outcome,
