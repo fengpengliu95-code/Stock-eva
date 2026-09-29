@@ -1287,8 +1287,14 @@ class BaoStockProvider:
         main_symbol_rows = [
             row[universe_code_index]
             for row in universe_rows
-            if _is_main_board(row[universe_code_index]) and row[universe_status_index] == "1"
+            if _is_main_board(row[universe_code_index])
         ]
+        if any(
+            row[universe_status_index] not in {"0", "1"}
+            for row in universe_rows
+            if _is_main_board(row[universe_code_index])
+        ):
+            raise _candidate_integrity_error("BaoStock candidate has invalid trading status")
         _require_unique_symbols(main_symbol_rows)
         main_symbols = set(main_symbol_rows)
         daily_fields, daily_rows = self._read(

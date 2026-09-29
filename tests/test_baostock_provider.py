@@ -408,6 +408,41 @@ def test_provider_bulk_slice_filters_main_board_and_adds_indexes() -> None:
     ]
 
 
+def test_provider_bulk_slice_keeps_historical_suspended_symbol_in_exact_universe() -> None:
+    payload = json.loads(FIXTURE_PATH.read_text())
+    fields = payload["daily_fields"]
+    code_index = fields.index("code")
+    status_index = fields.index("tradestatus")
+    suspended_symbol = "sh.600001"
+    for row in payload["daily_rows"]:
+        if row[code_index] != suspended_symbol:
+            continue
+        row[status_index] = "0"
+        for field in ("volume", "amount", "turn", "pctChg"):
+            row[fields.index(field)] = ""
+
+    class HistoricalSuspensionClient(FakeBaoStock):
+        def query_all_stock(self, **kwargs):
+            result = super().query_all_stock(**kwargs)
+            rows = list(result.rows)
+            for row in rows:
+                if row[0] == suspended_symbol:
+                    row[1] = "0"
+            return FakeResult(result.fields, rows)
+
+    provider = BaoStockProvider(client=HistoricalSuspensionClient(payload))
+
+    batch = provider.fetch(date(2026, 7, 23))
+
+    suspended = next(bar for bar in batch.bars if bar.symbol == suspended_symbol)
+    assert suspended.is_trading is False
+    assert suspended.is_suspended is True
+    assert suspended.quality_status == "partial"
+    assert suspended.quality_issues == ["suspended_placeholder"]
+    assert suspended_symbol in batch.expected_symbols
+    assert suspended_symbol not in batch.failed_symbols
+
+
 def test_universe_inspection_reads_metadata_without_fetching_market_rows() -> None:
     payload = json.loads(FIXTURE_PATH.read_text())
 
