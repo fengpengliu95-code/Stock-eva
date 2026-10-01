@@ -114,10 +114,18 @@ if ! /usr/bin/grep -Eq '^STOCK_EVA_AUTO_REFRESH_ENABLED=false$' "$ENV_FILE"; the
   echo "the LaunchAgent one-shot schedule owns refresh execution" >&2
   exit 1
 fi
-if /usr/bin/grep -q '^STOCK_EVA_USER_DATA_DIR=' "$ENV_FILE" \
-  && ! /usr/bin/grep -Eq '^STOCK_EVA_USER_DATA_DIR=var/user/?$' "$ENV_FILE"; then
-  echo "error: LaunchAgent backup requires STOCK_EVA_USER_DATA_DIR=var/user" >&2
-  exit 1
+if /usr/bin/grep -q '^STOCK_EVA_USER_DATA_DIR=' "$ENV_FILE"; then
+  CONFIGURED_USER_DATA_DIR="$(
+    /usr/bin/awk -F= '$1 == "STOCK_EVA_USER_DATA_DIR" { print substr($0, index($0, "=") + 1); exit }' \
+      "$ENV_FILE"
+  )"
+  if [[ "$CONFIGURED_USER_DATA_DIR" != "var/user" \
+    && "$CONFIGURED_USER_DATA_DIR" != "var/user/" \
+    && "$CONFIGURED_USER_DATA_DIR" != "$DATA_ROOT/user" \
+    && "$CONFIGURED_USER_DATA_DIR" != "$DATA_ROOT/user/" ]]; then
+    echo "error: LaunchAgent backup requires STOCK_EVA_USER_DATA_DIR=var/user" >&2
+    exit 1
+  fi
 fi
 if /usr/bin/grep -q '^STOCK_EVA_USER_DATABASE_NAME=' "$ENV_FILE" \
   && ! /usr/bin/grep -Eq \

@@ -1332,6 +1332,32 @@ def test_installer_rejects_backup_path_override_it_cannot_honor(
     assert "STOCK_EVA_USER_DATA_DIR=var/user" in result.stderr
 
 
+def test_installer_accepts_its_normalized_installed_user_data_path(
+    tmp_path: Path,
+) -> None:
+    project = synthetic_project(tmp_path)
+    environment = install_environment(
+        tmp_path,
+        launchctl=fake_launchctl(tmp_path),
+        lsof=fake_lsof(tmp_path, occupied=False),
+    )
+    installed_user_dir = (
+        Path(environment["HOME"]) / "Library/Application Support/Stock EVA/data/user"
+    )
+    env_path = project / ".env"
+    env_path.write_text(
+        env_path.read_text().replace(
+            "STOCK_EVA_USER_DATA_DIR=var/user",
+            f"STOCK_EVA_USER_DATA_DIR={installed_user_dir}",
+        )
+    )
+
+    result = run_installer(project, environment, mode="--check")
+
+    assert result.returncode == 0, result.stderr
+    assert "mutation=false" in result.stdout
+
+
 def test_installer_rejects_portfolio_database_name_override_before_install(
     tmp_path: Path,
 ) -> None:
