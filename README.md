@@ -519,5 +519,8 @@ graph TD
 
 ---
 
+CI：Ubuntu 与 macOS / Python 3.12 / uv frozen lockfile。完整命令、平台测试边界和失败排查见
+[CI 说明](docs/ci.md)。
+
 <sub>最后更新：2026 年 7 月 | 持续维护中 🚀</sub>
 </p>
