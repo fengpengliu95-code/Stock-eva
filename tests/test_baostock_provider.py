@@ -887,10 +887,12 @@ def test_each_pagination_network_step_gets_the_unchanged_deadline() -> None:
 def test_nonempty_recv_progress_renews_the_unchanged_deadline() -> None:
     class ProgressSocket(FakeSocket):
         def recv(self, _size) -> bytes:
-            time.sleep(0.015)
+            time.sleep(0.04)
             return b"x"
 
-    timeout = 0.025
+    # Keep each receive comfortably below the deadline even on a loaded hosted
+    # runner, while the aggregate duration still exceeds that same deadline.
+    timeout = 0.1
     client = FakeBaoStock(json.loads(FIXTURE_PATH.read_text()))
     client.context = SimpleNamespace(default_socket=ProgressSocket())
     provider = BaoStockProvider(
