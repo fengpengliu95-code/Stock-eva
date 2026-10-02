@@ -3,6 +3,7 @@ import plistlib
 import shutil
 import stat
 import subprocess
+import sys
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -387,7 +388,8 @@ def test_management_scripts_require_explicit_mutation_flags() -> None:
     assert "launchctl print" in status
     assert '"$LAUNCHCTL" bootstrap' in installer
     assert '"$LAUNCHCTL" bootout' in uninstaller
-    assert '/bin/mv -fh "$NEXT_CURRENT" "$RUNTIME_CURRENT"' in installer
+    assert 'MV="${STOCK_EVA_MV:-/bin/mv}"' in installer
+    assert '"$MV" -fh "$NEXT_CURRENT" "$RUNTIME_CURRENT"' in installer
     assert "wait_for_http" in status
     assert '[[ "$attempt" -le 15 ]]' in status
 
@@ -625,10 +627,61 @@ def install_environment(
         "STOCK_EVA_LSOF": str(lsof),
         "STOCK_EVA_UV": str(fake_uv(tmp_path)),
         "STOCK_EVA_NPM": str(fake_npm(tmp_path)),
+        "STOCK_EVA_PLUTIL": str(validating_plutil(tmp_path)),
+        "STOCK_EVA_DITTO": str(copying_ditto(tmp_path)),
+        "STOCK_EVA_MV": str(atomic_symlink_mv(tmp_path)),
         "NPM_CALL_LOG": str(tmp_path / "npm.log"),
         "RUNTIME_PYTHON_CALL_LOG": str(tmp_path / "runtime-python.log"),
         "STOCK_EVA_UNAME": "Darwin",
     }
+
+
+def validating_plutil(tmp_path: Path) -> Path:
+    """Exercise real plist parsing on any host; do not fake lint success."""
+    if sys.platform == "darwin":
+        return Path("/usr/bin/plutil")
+    executable = tmp_path / "validate-plist"
+    executable.write_text(
+        f"#!{sys.executable}\n"
+        "import plistlib, sys\n"
+        "assert sys.argv[1] == '-lint'\n"
+        "with open(sys.argv[2], 'rb') as stream:\n"
+        "    assert isinstance(plistlib.load(stream), dict)\n"
+    )
+    executable.chmod(0o755)
+    return executable
+
+
+def copying_ditto(tmp_path: Path) -> Path:
+    if sys.platform == "darwin":
+        return Path("/usr/bin/ditto")
+    executable = tmp_path / "copy-tree"
+    executable.write_text(
+        f"#!{sys.executable}\n"
+        "import shutil, sys\n"
+        "from pathlib import Path\n"
+        "source, destination = map(Path, sys.argv[1:])\n"
+        "if source.is_dir():\n"
+        "    shutil.copytree(source, destination, dirs_exist_ok=True, symlinks=True)\n"
+        "else:\n"
+        "    shutil.copy2(source, destination)\n"
+    )
+    executable.chmod(0o755)
+    return executable
+
+
+def atomic_symlink_mv(tmp_path: Path) -> Path:
+    if sys.platform == "darwin":
+        return Path("/bin/mv")
+    executable = tmp_path / "atomic-symlink-mv"
+    executable.write_text(
+        f"#!{sys.executable}\n"
+        "import os, sys\n"
+        "assert sys.argv[1] == '-fh'\n"
+        "os.replace(sys.argv[2], sys.argv[3])\n"
+    )
+    executable.chmod(0o755)
+    return executable
 
 
 def stateful_install_environment(tmp_path: Path) -> dict[str, str]:

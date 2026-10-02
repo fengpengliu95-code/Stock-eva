@@ -29,6 +29,7 @@ import threading
 import time
 import unicodedata
 import urllib.request
+from contextlib import closing
 from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
@@ -6626,9 +6627,8 @@ def test_r2f5_three_state_slo_oracle_consumes_raw_mutations(
             assert any(value is None for value in window.values()) or not golden.leaf_files
         elif mutation == "corrupt_control":
             with pytest.raises(sqlite3.DatabaseError):
-                sqlite3.connect(golden.controls["replication_sidecar"]).execute(
-                    "SELECT 1"
-                ).fetchone()
+                with closing(sqlite3.connect(golden.controls["replication_sidecar"])) as connection:
+                    connection.execute("SELECT name FROM sqlite_master").fetchall()
 
 
 def test_r2f5_wrong_algorithm_mutant_is_killed() -> None:

@@ -2,13 +2,12 @@
 
 from __future__ import annotations
 
-import ctypes
+import errno
 import hashlib
 import json
 import os
 import stat
 from contextlib import contextmanager
-from ctypes import CDLL, c_char_p, c_int, c_uint
 from datetime import date, datetime
 from enum import StrEnum
 from pathlib import Path
@@ -34,6 +33,7 @@ from backend.app.market.providers.base import (
     SafeRelativePath,
     SafeSha256,
 )
+from backend.app.storage.atomic import rename_noreplace_bound
 
 
 def _canonical(value: Any) -> bytes:
@@ -688,28 +688,13 @@ class CandidateStore:
         destination: str,
     ) -> None:
         try:
-            libc = CDLL(None, use_errno=True)
-            renameatx_np = libc.renameatx_np
-        except AttributeError as exc:
-            raise EvidenceError(
-                "atomic bundle publication is unavailable", "EVIDENCE_WRITE_FAILED"
-            ) from exc
-        renameatx_np.argtypes = [c_int, c_char_p, c_int, c_char_p, c_uint]
-        renameatx_np.restype = c_int
-        if (
-            renameatx_np(
-                source_parent,
-                source.encode(),
-                destination_parent,
-                destination.encode(),
-                0x00000004,
-            )
-            != 0
-        ):
-            error = OSError(ctypes.get_errno(), os.strerror(ctypes.get_errno()))
-            if error.errno == getattr(os, "EEXIST", 17):
-                raise FileExistsError(destination)
-            raise error
+            rename_noreplace_bound(source_parent, source, destination_parent, destination)
+        except OSError as exc:
+            if exc.errno in {errno.ENOSYS, errno.ENOTSUP}:
+                raise EvidenceError(
+                    "atomic bundle publication is unavailable", "EVIDENCE_WRITE_FAILED"
+                ) from exc
+            raise
 
     @staticmethod
     def _remove_owned_stage(parent: int, name: str) -> None:

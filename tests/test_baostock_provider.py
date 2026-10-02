@@ -858,8 +858,12 @@ def test_retry_attempts_have_a_derived_total_wall_clock_bound() -> None:
 
 
 def test_each_pagination_network_step_gets_the_unchanged_deadline() -> None:
-    timeout = 0.025
-    step_seconds = 0.015
+    # Hosted macOS runners can pause a process for tens of milliseconds while
+    # delivering SIGALRM.  Keep every step comfortably inside its own deadline
+    # while making the aggregate operation exceed that deadline, which is the
+    # contract this test is intended to prove.
+    timeout = 0.1
+    step_seconds = 0.04
     client = FakeBaoStock(json.loads(FIXTURE_PATH.read_text()))
     provider = BaoStockProvider(
         client=client,
@@ -883,10 +887,12 @@ def test_each_pagination_network_step_gets_the_unchanged_deadline() -> None:
 def test_nonempty_recv_progress_renews_the_unchanged_deadline() -> None:
     class ProgressSocket(FakeSocket):
         def recv(self, _size) -> bytes:
-            time.sleep(0.015)
+            time.sleep(0.04)
             return b"x"
 
-    timeout = 0.025
+    # Keep each receive comfortably below the deadline even on a loaded hosted
+    # runner, while the aggregate duration still exceeds that same deadline.
+    timeout = 0.1
     client = FakeBaoStock(json.loads(FIXTURE_PATH.read_text()))
     client.context = SimpleNamespace(default_socket=ProgressSocket())
     provider = BaoStockProvider(
@@ -924,7 +930,7 @@ def test_deadline_never_leaves_uncancellable_request_workers() -> None:
             provider._read(ProviderEndpoint.INDEX_HISTORY, client.blocking_query)
         assert (
             time.monotonic() - started_at
-            <= (provider.max_attempts * provider.socket_timeout_seconds) + 0.1
+            <= (provider.max_attempts * provider.socket_timeout_seconds) + 0.25
         )
 
         leaked_workers = [

@@ -14,6 +14,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from backend.app.market.canonical_comparison import PublishedCanonicalComparison
+from backend.app.storage.atomic import rename_noreplace
 
 from .providers.registry import ShadowRegistry
 from .shadow_evidence import ShadowEvidenceReader
@@ -104,44 +105,7 @@ def _assert_no_symlink_chain(path: Path) -> None:
 
 def _rename_noclobber(source: Path, destination: Path) -> None:
     """Atomically publish a directory without replacing an existing bundle."""
-    if destination.exists():
-        raise FileExistsError(destination)
-    # macOS exposes renameatx_np(RENAME_EXCL), which closes the check/rename race.
-    try:
-        import ctypes
-
-        libc = ctypes.CDLL(None, use_errno=True)
-        renameatx_np = libc.renameatx_np
-        renameatx_np.argtypes = [
-            ctypes.c_int,
-            ctypes.c_char_p,
-            ctypes.c_int,
-            ctypes.c_char_p,
-            ctypes.c_uint,
-        ]
-        renameatx_np.restype = ctypes.c_int
-        parent_fd = os.open(destination.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
-        source_parent_fd = os.open(source.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
-        try:
-            result = renameatx_np(
-                source_parent_fd,
-                source.name.encode(),
-                parent_fd,
-                destination.name.encode(),
-                0x00000004,
-            )
-            if result != 0:
-                error = ctypes.get_errno()
-                raise OSError(error, os.strerror(error), destination)
-            return
-        finally:
-            os.close(source_parent_fd)
-            os.close(parent_fd)
-    except AttributeError:
-        # Non-Darwin fallback: the precondition remains no-clobber for supported CI.
-        if destination.exists():
-            raise FileExistsError(destination) from None
-        os.rename(source, destination)
+    rename_noreplace(source, destination)
 
 
 class ShadowQualityReport(BaseModel):

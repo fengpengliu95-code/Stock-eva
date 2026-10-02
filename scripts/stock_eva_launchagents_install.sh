@@ -42,6 +42,9 @@ LAUNCHCTL="${STOCK_EVA_LAUNCHCTL:-/bin/launchctl}"
 LSOF="${STOCK_EVA_LSOF:-/usr/sbin/lsof}"
 UV="${STOCK_EVA_UV:-$(command -v uv || true)}"
 NPM="${STOCK_EVA_NPM:-$(command -v npm || true)}"
+PLUTIL="${STOCK_EVA_PLUTIL:-/usr/bin/plutil}"
+DITTO="${STOCK_EVA_DITTO:-/usr/bin/ditto}"
+MV="${STOCK_EVA_MV:-/bin/mv}"
 
 if [[ "$SYSTEM_NAME" != "Darwin" ]]; then
   echo "error: LaunchAgents are supported only on macOS" >&2
@@ -194,7 +197,7 @@ for label in "${LABELS[@]}"; do
     -e "s|__LOG_DIR__|$LOG_ESCAPED|g" \
     -e "s|__BACKUP_ROOT__|$BACKUP_ESCAPED|g" \
     "$template" >"$rendered"
-  /usr/bin/plutil -lint "$rendered" >/dev/null
+  "$PLUTIL" -lint "$rendered" >/dev/null
   if /usr/bin/grep -q '__[A-Z_][A-Z_]*__' "$rendered"; then
     echo "error: unresolved template token in $label" >&2
     exit 1
@@ -369,7 +372,7 @@ if [[ ! -f "$RELEASE_ROOT/.ready" ]]; then
       | /usr/bin/tar -xf - -C "$RUNTIME_STAGE"
   else
     for relative in "${RUNTIME_ASSETS[@]}"; do
-      /usr/bin/ditto "$PROJECT_ROOT/$relative" "$RUNTIME_STAGE/$relative"
+      "$DITTO" "$PROJECT_ROOT/$relative" "$RUNTIME_STAGE/$relative"
     done
   fi
   (
@@ -491,7 +494,7 @@ for name in market user control staging locks tmp; do
   source="$PROJECT_ROOT/var/$name"
   if [[ -d "$source" ]] \
     && [[ -z "$(/usr/bin/find "$destination" -mindepth 1 -print -quit)" ]]; then
-    /usr/bin/ditto "$source" "$destination"
+    "$DITTO" "$source" "$destination"
   fi
 done
 /bin/chmod 0700 "$DATA_ROOT"
@@ -514,15 +517,16 @@ if ! wait_for_port_release 8000; then
   false
 fi
 
-set +e
-(
+if (
   cd "$CONFIG_ROOT"
   "$RELEASE_ROOT/.venv/bin/python" \
     -m backend.app.cli market-schema-migrate \
     >/dev/null 2>&1
-)
-SCHEMA_MIGRATION_STATUS=$?
-set -e
+); then
+  SCHEMA_MIGRATION_STATUS=0
+else
+  SCHEMA_MIGRATION_STATUS=$?
+fi
 if [[ "$SCHEMA_MIGRATION_STATUS" -ne 0 ]]; then
   echo "error: market control schema migration failed" >&2
   rollback "$SCHEMA_MIGRATION_STATUS"
@@ -560,7 +564,7 @@ NEXT_CURRENT="$RUNTIME_ROOT/.current.$$"
 /bin/rm -f "$NEXT_CURRENT"
 /bin/ln -s "releases/$RELEASE_ID" "$NEXT_CURRENT"
 # BSD mv follows a destination symlink to a directory unless -h is explicit.
-/bin/mv -fh "$NEXT_CURRENT" "$RUNTIME_CURRENT"
+"$MV" -fh "$NEXT_CURRENT" "$RUNTIME_CURRENT"
 CURRENT_SWAPPED=1
 
 LOG_FILES=(

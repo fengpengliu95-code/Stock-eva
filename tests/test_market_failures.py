@@ -261,6 +261,10 @@ def test_existing_refresh_schema_migrates_failure_fields_as_null(tmp_path: Path)
     assert legacy.retryable is None
 
 
+@pytest.mark.skipif(
+    sys.platform != "darwin",
+    reason="Native UF_APPEND/renameatx_np integration; covered by the macOS CI job",
+)
 def test_market_schema_migration_cli_upgrades_legacy_control_store(
     tmp_path: Path,
     monkeypatch,
@@ -333,6 +337,10 @@ def test_market_schema_migration_cli_upgrades_legacy_control_store(
     assert MarketStore._refresh_result_from_row(legacy_projection).run_id == "legacy-cli"
 
 
+@pytest.mark.skipif(
+    sys.platform != "darwin",
+    reason="Native UF_APPEND/renameatx_np integration; covered by the macOS CI job",
+)
 def test_market_schema_migration_cli_is_idempotent_for_empty_and_current_store(
     tmp_path: Path,
     monkeypatch,
@@ -436,6 +444,10 @@ def test_writer_schema_migration_rejects_ancestor_symlinks_before_external_write
     assert not any(external_staging.iterdir())
 
 
+@pytest.mark.skipif(
+    sys.platform != "darwin",
+    reason="Native UF_APPEND/renameatx_np integration; covered by the macOS CI job",
+)
 def test_writer_schema_migration_publish_race_preserves_foreign_target(
     tmp_path: Path,
     monkeypatch,
@@ -469,6 +481,10 @@ def test_writer_schema_migration_publish_race_preserves_foreign_target(
     assert list(staging.iterdir()) == []
 
 
+@pytest.mark.skipif(
+    sys.platform != "darwin",
+    reason="Native UF_APPEND/renameatx_np integration; covered by the macOS CI job",
+)
 def test_writer_schema_migration_parent_replacement_race_is_fail_closed(
     tmp_path: Path,
     monkeypatch,
@@ -503,6 +519,10 @@ def test_writer_schema_migration_parent_replacement_race_is_fail_closed(
 
 
 @pytest.mark.parametrize("database_kind", ["new", "existing"])
+@pytest.mark.skipif(
+    sys.platform != "darwin",
+    reason="Native UF_APPEND/renameatx_np integration; covered by the macOS CI job",
+)
 def test_writer_schema_duckdb_open_is_bound_to_inherited_directory_fd(
     tmp_path: Path,
     monkeypatch,
@@ -575,6 +595,10 @@ def test_writer_schema_duckdb_open_is_bound_to_inherited_directory_fd(
 
 
 @pytest.mark.parametrize("database_kind", ["new", "existing"])
+@pytest.mark.skipif(
+    sys.platform != "darwin",
+    reason="Native UF_APPEND/renameatx_np integration; covered by the macOS CI job",
+)
 def test_writer_schema_rejects_basename_symlink_before_child_open_without_external_write(
     tmp_path: Path,
     monkeypatch,
@@ -622,6 +646,10 @@ def test_writer_schema_rejects_basename_symlink_before_child_open_without_extern
 @pytest.mark.parametrize(
     ("database_kind", "tamper_kind"),
     [("new", "symlink"), ("new", "regular"), ("existing", "same_inode")],
+)
+@pytest.mark.skipif(
+    sys.platform != "darwin",
+    reason="Native UF_APPEND/renameatx_np integration; covered by the macOS CI job",
 )
 def test_writer_schema_child_rejects_preopen_input_tampering(
     tmp_path: Path,
@@ -707,6 +735,10 @@ def test_writer_schema_child_rejects_preopen_input_tampering(
         assert (target.stat().st_ino, target.read_bytes()) == canonical_before
 
 
+@pytest.mark.skipif(
+    sys.platform != "darwin",
+    reason="Native UF_APPEND/renameatx_np integration; covered by the macOS CI job",
+)
 def test_existing_writer_schema_detects_held_source_same_inode_marker_before_exchange(
     tmp_path: Path,
     monkeypatch,
@@ -752,6 +784,10 @@ def test_existing_writer_schema_detects_held_source_same_inode_marker_before_exc
     assert sum(item.stat().st_ino == original_inode for item in tmp_path.rglob("*")) == 1
 
 
+@pytest.mark.skipif(
+    sys.platform != "darwin",
+    reason="Native UF_APPEND/renameatx_np integration; covered by the macOS CI job",
+)
 def test_existing_writer_schema_first_post_swap_fsync_failure_rolls_back_original(
     tmp_path: Path,
     monkeypatch,
@@ -809,6 +845,10 @@ def test_existing_writer_schema_first_post_swap_fsync_failure_rolls_back_origina
     assert list(staging.iterdir()) == []
 
 
+@pytest.mark.skipif(
+    sys.platform != "darwin",
+    reason="Native UF_APPEND/renameatx_np integration; covered by the macOS CI job",
+)
 def test_existing_writer_schema_rolls_back_same_inode_append_during_exchange_window(
     tmp_path: Path,
     monkeypatch,
@@ -860,6 +900,10 @@ def test_existing_writer_schema_rolls_back_same_inode_append_during_exchange_win
     assert list(staging.iterdir()) == []
 
 
+@pytest.mark.skipif(
+    sys.platform != "darwin",
+    reason="Native UF_APPEND/renameatx_np integration; covered by the macOS CI job",
+)
 def test_existing_writer_schema_rolls_back_foreign_entry_during_exchange_window(
     tmp_path: Path,
     monkeypatch,
@@ -913,6 +957,10 @@ def test_existing_writer_schema_rolls_back_foreign_entry_during_exchange_window(
     assert list(staging.iterdir()) == []
 
 
+@pytest.mark.skipif(
+    sys.platform != "darwin",
+    reason="Native UF_APPEND/renameatx_np integration; covered by the macOS CI job",
+)
 def test_existing_writer_schema_rolls_back_when_configured_parent_changes_during_exchange(
     tmp_path: Path,
     monkeypatch,
@@ -978,6 +1026,10 @@ def test_existing_writer_schema_rolls_back_when_configured_parent_changes_during
     assert list(staging.iterdir()) == []
 
 
+@pytest.mark.skipif(
+    sys.platform != "darwin",
+    reason="Native UF_APPEND/renameatx_np integration; covered by the macOS CI job",
+)
 def test_existing_writer_schema_child_failure_preserves_original_bytes_and_schema(
     tmp_path: Path,
     monkeypatch,
@@ -1024,6 +1076,10 @@ def test_existing_writer_schema_child_failure_preserves_original_bytes_and_schem
         "target_race",
         "swapback_race",
     ],
+)
+@pytest.mark.skipif(
+    sys.platform != "darwin",
+    reason="Native UF_APPEND/renameatx_np integration; covered by the macOS CI job",
 )
 def test_existing_writer_schema_secure_publish_failures_preserve_evidence(
     tmp_path: Path,
@@ -1151,6 +1207,10 @@ def test_existing_writer_schema_secure_publish_failures_preserve_evidence(
 
 
 @pytest.mark.parametrize("registered", [False, True])
+@pytest.mark.skipif(
+    sys.platform != "darwin",
+    reason="Native UF_APPEND/renameatx_np integration; covered by the macOS CI job",
+)
 def test_writer_schema_cleanup_only_removes_registered_wal_inode(
     tmp_path: Path,
     monkeypatch,
@@ -1201,6 +1261,10 @@ def test_writer_schema_cleanup_only_removes_registered_wal_inode(
 
 
 @pytest.mark.parametrize("failure_mode", ["exception", "timeout", "nonzero", "residual"])
+@pytest.mark.skipif(
+    sys.platform != "darwin",
+    reason="Native UF_APPEND/renameatx_np integration; covered by the macOS CI job",
+)
 def test_writer_schema_child_failure_modes_are_fail_closed(
     tmp_path: Path,
     monkeypatch,
