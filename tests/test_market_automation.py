@@ -2807,6 +2807,10 @@ def test_market_schema_migration_busy_lock_is_sanitized_and_zero_write(
     }
 
 
+@pytest.mark.skipif(
+    sys.platform != "darwin",
+    reason="Native UF_APPEND/renameatx_np integration; covered by the macOS CI job",
+)
 def test_market_schema_migration_adds_continuity_tables_under_shared_lock(
     tmp_path: Path,
     monkeypatch,
@@ -2835,6 +2839,10 @@ def test_market_schema_migration_adds_continuity_tables_under_shared_lock(
         }
 
 
+@pytest.mark.skipif(
+    sys.platform != "darwin",
+    reason="Native UF_APPEND/renameatx_np integration; covered by the macOS CI job",
+)
 def test_market_schema_migration_rolls_back_base_when_continuity_stage_fails(
     tmp_path: Path,
     monkeypatch,
@@ -2899,6 +2907,10 @@ def test_market_schema_migration_rolls_back_base_when_continuity_stage_fails(
     assert "repair_jobs" not in tables
 
 
+@pytest.mark.skipif(
+    sys.platform != "darwin",
+    reason="Native UF_APPEND/renameatx_np integration; covered by the macOS CI job",
+)
 def test_market_schema_migration_new_database_failure_leaves_tree_unchanged(
     tmp_path: Path,
     monkeypatch,
@@ -3033,6 +3045,10 @@ def test_writer_schema_migration_rejects_symlink_parent_scope(
     assert not os.path.lexists(target)
 
 
+@pytest.mark.skipif(
+    sys.platform != "darwin",
+    reason="Native UF_APPEND/renameatx_np integration; covered by the macOS CI job",
+)
 def test_writer_schema_migration_refuses_staging_allocation_collision(
     tmp_path: Path,
     monkeypatch,
@@ -3061,6 +3077,10 @@ def test_writer_schema_migration_refuses_staging_allocation_collision(
     assert not target.parent.exists()
 
 
+@pytest.mark.skipif(
+    sys.platform != "darwin",
+    reason="Native UF_APPEND/renameatx_np integration; covered by the macOS CI job",
+)
 def test_writer_schema_migration_link_failure_cleans_only_owned_artifacts(
     tmp_path: Path,
     monkeypatch,
@@ -3085,6 +3105,10 @@ def test_writer_schema_migration_link_failure_cleans_only_owned_artifacts(
     assert not target.parent.exists()
 
 
+@pytest.mark.skipif(
+    sys.platform != "darwin",
+    reason="Native UF_APPEND/renameatx_np integration; covered by the macOS CI job",
+)
 def test_writer_schema_migration_target_collision_preserves_external_file(
     tmp_path: Path,
     monkeypatch,
@@ -3121,6 +3145,10 @@ def test_writer_schema_migration_target_collision_preserves_external_file(
     assert list(staging.iterdir()) == []
 
 
+@pytest.mark.skipif(
+    sys.platform != "darwin",
+    reason="Native UF_APPEND/renameatx_np integration; covered by the macOS CI job",
+)
 def test_writer_schema_migration_secures_modes_and_replaces_existing_with_cow_inode(
     tmp_path: Path,
 ) -> None:

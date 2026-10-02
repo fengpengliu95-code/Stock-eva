@@ -1058,6 +1058,10 @@ def test_portfolio_and_fund_flow_outer_operations_pass_concrete_calendar_snapsho
     assert calendar.snapshot_calls == 2
 
 
+@pytest.mark.skipif(
+    sys.platform != "darwin",
+    reason="Native UF_APPEND/renameatx_np integration; covered by the macOS CI job",
+)
 def test_market_continuity_execute_enqueues_only_after_strict_rescan(
     tmp_path: Path,
     monkeypatch,

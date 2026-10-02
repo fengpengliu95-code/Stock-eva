@@ -575,7 +575,10 @@ def test_task14_raw_response_bytes_are_in_immutable_isolated_evidence(tmp_path):
     )
     assert result.writes_evidence is True
     bundle = ShadowEvidenceReader(tmp_path).read(result.evidence_id)
-    page = next((tmp_path / "bundles" / result.evidence_id / "pages").glob("*.json"))
+    # Filesystem iteration order is not the request order. Bind to manifest ordinal 0.
+    root = tmp_path / "bundles" / result.evidence_id
+    manifest = json.loads((root / "manifest.json").read_text())
+    page = root / manifest["pages"][0]["relative_path"]
     encoded = json.loads(page.read_text())["raw_response_b64"]
     assert base64.b64decode(encoded) == first_raw
     assert bundle.evidence_id == result.evidence_id

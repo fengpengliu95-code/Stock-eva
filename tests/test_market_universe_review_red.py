@@ -818,15 +818,14 @@ def test_user_capture_fails_closed_when_path_is_replaced_after_open(tmp_path, mo
     UserStore(replacement).create_position(
         PositionCreate(symbol="sh.600001", quantity=1, avg_cost=1, as_of_date=date(2026, 9, 1))
     )
-    original_fcntl = __import__("backend.app.user.store", fromlist=["fcntl"]).fcntl.fcntl
+    original_connect = sqlite3.connect
 
-    def swap_after_open(fd, command, argument):
-        result = original_fcntl(fd, command, argument)
-        if command == __import__("backend.app.user.store", fromlist=["fcntl"]).fcntl.F_GETPATH:
-            replacement.replace(path)
-        return result
+    def swap_after_open(*args, **kwargs):
+        # Connection admission is after the no-follow descriptor open on both OSes.
+        replacement.replace(path)
+        return original_connect(*args, **kwargs)
 
-    monkeypatch.setattr("backend.app.user.store.fcntl.fcntl", swap_after_open)
+    monkeypatch.setattr("backend.app.user.store.sqlite3.connect", swap_after_open)
     with pytest.raises(UserDataError):
         store.capture_required_symbol_snapshot_existing()
 
@@ -849,15 +848,13 @@ def test_universe_sidecar_fails_closed_when_path_is_replaced_after_open(tmp_path
     replacement = tmp_path / "replacement.sqlite3"
     UniverseSidecarStore(path).initialize()
     UniverseSidecarStore(replacement).initialize()
-    original_fcntl = __import__("backend.app.market.universe", fromlist=["fcntl"]).fcntl.fcntl
+    original_connect = sqlite3.connect
 
-    def swap_after_open(fd, command, argument):
-        result = original_fcntl(fd, command, argument)
-        if command == __import__("backend.app.market.universe", fromlist=["fcntl"]).fcntl.F_GETPATH:
-            replacement.replace(path)
-        return result
+    def swap_after_open(*args, **kwargs):
+        replacement.replace(path)
+        return original_connect(*args, **kwargs)
 
-    monkeypatch.setattr("backend.app.market.universe.fcntl.fcntl", swap_after_open)
+    monkeypatch.setattr("backend.app.market.universe.sqlite3.connect", swap_after_open)
     with pytest.raises(UniverseStoreUnavailable):
         UniverseSidecarStore(path).read_head()
 

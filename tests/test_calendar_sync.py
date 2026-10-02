@@ -232,7 +232,8 @@ def test_calendar_sync_migrated_store_requires_matching_completed_evidence(
             migration_id = connection.execute(
                 "SELECT migration_id FROM calendar_store_identity WHERE singleton = 1"
             ).fetchone()[0]
-        completed.unlink()
+        # Retain the original inode: unlink/recreate can reuse it immediately on Linux.
+        completed.rename(completed.with_suffix(".original"))
         completed.write_text(migration_id)
 
     with pytest.raises(CalendarSyncStoreReadError):

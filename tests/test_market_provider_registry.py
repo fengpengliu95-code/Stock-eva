@@ -581,15 +581,11 @@ def test_round2_material_reset_requires_provider_and_window_cas_versions():
 
 
 def test_round2_descriptor_read_rejects_mode_and_trusted_tmp_alias_is_physical(tmp_path):
-    settings = Settings(provider_shadow_root=Path("/tmp") / "stock-eva-round2-root")
-    physical = Path("/private/tmp/stock-eva-round2-root")
-    physical.mkdir(mode=0o700, exist_ok=True)
-    try:
-        assert (
-            StorageLayout(settings).validate_provider_shadow_root() == settings.provider_shadow_root
-        )
-    finally:
-        physical.rmdir()
+    # Use the host\'s real trusted /tmp alias without a shared, fixed-name fixture.
+    settings = Settings(provider_shadow_root=tmp_path / "shadow")
+    physical = settings.provider_shadow_root.resolve()
+    physical.mkdir(mode=0o700)
+    assert StorageLayout(settings).validate_provider_shadow_root() == physical
     terms = _terms()
     registry = ShadowRegistry.in_memory()
     registry.initialize()
