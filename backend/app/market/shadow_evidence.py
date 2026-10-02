@@ -13,13 +13,14 @@ import json
 import os
 import secrets
 import stat
-import sys
 from collections.abc import Iterable
 from datetime import date
 from pathlib import Path
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, StrictStr, model_validator
+
+from backend.app.storage.atomic import rename_noreplace
 
 
 class ShadowEvidenceUnavailable(RuntimeError):
@@ -1403,51 +1404,12 @@ def _remove_owned_tree_by_name(
 
 
 def _exclusive_rename(source: Path, destination: Path) -> None:
-    if destination.exists():
-        raise FileExistsError(destination)
-    # macOS exposes renameatx_np(2), whose RENAME_EXCL flag makes this one
-    # atomic no-clobber operation.  Keep a conservative fallback for Linux test
-    # runners; the destination preflight still makes ordinary collisions fail
-    # closed, and never replaces an existing bundle.
-    if sys.platform == "darwin":
-        import ctypes
-
-        renameatx_np = getattr(ctypes.CDLL(None), "renameatx_np", None)
-        if renameatx_np is None:
-            raise ShadowEvidenceUnavailable("shadow atomic publish unavailable")
-        renameatx_np.argtypes = [
-            ctypes.c_int,
-            ctypes.c_char_p,
-            ctypes.c_int,
-            ctypes.c_char_p,
-            ctypes.c_uint,
-        ]
-        renameatx_np.restype = ctypes.c_int
-        source_parent = os.open(
-            source.parent,
-            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
-        )
-        destination_parent = os.open(
-            destination.parent,
-            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
-        )
-        try:
-            if (
-                renameatx_np(
-                    source_parent,
-                    source.name.encode(),
-                    destination_parent,
-                    destination.name.encode(),
-                    0x00000004,
-                )
-                != 0
-            ):
-                raise ShadowEvidenceUnavailable("shadow atomic publish unavailable")
-        finally:
-            os.close(source_parent)
-            os.close(destination_parent)
-        return
-    os.rename(source, destination)
+    try:
+        rename_noreplace(source, destination)
+    except FileExistsError:
+        raise
+    except OSError as exc:
+        raise ShadowEvidenceUnavailable("shadow atomic publish unavailable") from exc
 
 
 class ShadowEvidenceStore:

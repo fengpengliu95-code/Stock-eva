@@ -562,6 +562,13 @@ class MarketStore:
         """Atomically migrate base and continuity schema under the caller-owned lock."""
         if self.read_only:
             raise RepairQueueError("read-only market store cannot migrate writer schema")
+        # Refuse before allocating staging/target directories. UF_APPEND is part of
+        # the reviewed security contract, not an optional optimization.
+        if sys.platform != "darwin":
+            raise RepairQueueError("secure market schema migration is unavailable on this platform")
+        library = CDLL(None, use_errno=True)
+        if not hasattr(library, "fchflags") or not hasattr(library, "renameatx_np"):
+            raise RepairQueueError("secure market schema migration is unavailable on this platform")
         staging_fd = -1
         target_parent_fd = -1
         created_directories: list[tuple[int, str, tuple[int, int]]] = []
