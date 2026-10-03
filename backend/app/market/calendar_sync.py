@@ -1886,18 +1886,19 @@ async def run_calendar_sync_loop(
     poll_seconds: float = 60,
     execute_plan: Callable[[CalendarSyncPlan], CalendarSyncResult | None] | None = None,
     runtime_maintenance: Callable[[], object] | None = None,
+    blocking_runner=run_blocking_drained,
 ) -> None:
     """Run runtime maintenance plus legacy monthly/daily checks without blocking the API."""
 
     initialize = getattr(service, "initialize_for_execution", None)
     if callable(initialize):
-        await run_blocking_drained(initialize)
+        await blocking_runner(initialize)
     startup = True
     while not stop.is_set():
         runtime_blocked = False
         if runtime_maintenance is not None:
             try:
-                runtime_result = await run_blocking_drained(runtime_maintenance)
+                runtime_result = await blocking_runner(runtime_maintenance)
             except Exception:
                 # A runtime maintenance bug/control failure must not terminate the existing
                 # scheduler or fall through to a legacy provider request in this iteration.
@@ -1921,7 +1922,7 @@ async def run_calendar_sync_loop(
             )
         )
         if plan is not None:
-            result = await run_blocking_drained(
+            result = await blocking_runner(
                 execute_plan or service.execute,
                 plan,
             )
