@@ -7,6 +7,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from backend.app.api.router import api_router
+from backend.app.blocking import run_blocking_process
 from backend.app.classification.provider import make_baostock_classification_provider
 from backend.app.classification.store import ClassificationStore
 from backend.app.config import CalendarRuntimeSettings, get_settings
@@ -109,13 +110,18 @@ async def _calendar_only_lifespan():
             clock=get_market_clock(),
             execute_plan=execute_calendar_plan,
             runtime_maintenance=runtime_service.execute,
+            blocking_runner=run_blocking_process,
         )
     )
+    await asyncio.sleep(0)
     try:
         yield
     finally:
         stop.set()
-        await calendar_task
+        calendar_task.cancel()
+        (result,) = await asyncio.gather(calendar_task, return_exceptions=True)
+        if isinstance(result, BaseException) and not isinstance(result, asyncio.CancelledError):
+            raise result
 
 
 @asynccontextmanager
@@ -345,6 +351,7 @@ async def lifespan(_: FastAPI):
             stop,
             clock=get_market_clock(),
             replication_drain=replication_drain,
+            blocking_runner=run_blocking_process,
         )
     )
     calendar_task = asyncio.create_task(
@@ -354,12 +361,16 @@ async def lifespan(_: FastAPI):
             clock=get_market_clock(),
             execute_plan=execute_calendar_plan,
             runtime_maintenance=runtime_maintenance,
+            blocking_runner=run_blocking_process,
         )
     )
+    await asyncio.sleep(0)
     try:
         yield
     finally:
         stop.set()
+        market_task.cancel()
+        calendar_task.cancel()
         results = await asyncio.gather(market_task, calendar_task, return_exceptions=True)
         for result in results:
             if isinstance(result, BaseException) and not isinstance(result, asyncio.CancelledError):
