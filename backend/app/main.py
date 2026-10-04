@@ -44,6 +44,7 @@ from backend.app.market.providers.baostock import BaoStockProviderAdapter
 from backend.app.market.store import MarketStore, MarketStoreReadError
 from backend.app.market.universe import UniverseSidecarStore
 from backend.app.orchestration.adapters import build_after_close_pipeline
+from backend.app.provider_process import ProviderProcessRunner
 from backend.app.storage.dataset import DatasetError, NasMarketStore
 from backend.app.storage.factory import (
     build_nas_market_store,
@@ -54,6 +55,11 @@ from backend.app.storage.preflight import StoragePreflight
 from backend.app.user.store import UserStore
 
 settings = get_settings()
+background_poll_seconds = 60.0
+
+
+def provider_process_runner_factory(kind, configured_settings):
+    return ProviderProcessRunner(kind, configured_settings, clock=get_market_clock())
 
 
 @asynccontextmanager
@@ -107,15 +113,21 @@ async def _calendar_only_lifespan():
             calendar_service,
             stop,
             clock=get_market_clock(),
+            poll_seconds=background_poll_seconds,
             execute_plan=execute_calendar_plan,
             runtime_maintenance=runtime_service.execute,
+            blocking_runner=provider_process_runner_factory("calendar", settings),
         )
     )
+    await asyncio.sleep(0)
     try:
         yield
     finally:
         stop.set()
-        await calendar_task
+        calendar_task.cancel()
+        (result,) = await asyncio.gather(calendar_task, return_exceptions=True)
+        if isinstance(result, BaseException) and not isinstance(result, asyncio.CancelledError):
+            raise result
 
 
 @asynccontextmanager
@@ -344,7 +356,9 @@ async def lifespan(_: FastAPI):
             service,
             stop,
             clock=get_market_clock(),
+            poll_seconds=background_poll_seconds,
             replication_drain=replication_drain,
+            blocking_runner=provider_process_runner_factory("market", settings),
         )
     )
     calendar_task = asyncio.create_task(
@@ -352,14 +366,19 @@ async def lifespan(_: FastAPI):
             calendar_service,
             stop,
             clock=get_market_clock(),
+            poll_seconds=background_poll_seconds,
             execute_plan=execute_calendar_plan,
             runtime_maintenance=runtime_maintenance,
+            blocking_runner=provider_process_runner_factory("calendar", settings),
         )
     )
+    await asyncio.sleep(0)
     try:
         yield
     finally:
         stop.set()
+        market_task.cancel()
+        calendar_task.cancel()
         results = await asyncio.gather(market_task, calendar_task, return_exceptions=True)
         for result in results:
             if isinstance(result, BaseException) and not isinstance(result, asyncio.CancelledError):
