@@ -18,7 +18,7 @@ from typing import Literal, Protocol
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from backend.app.blocking import run_blocking_drained
+from backend.app.blocking import BlockingOperation, run_blocking_operation
 from backend.app.classification.models import ClassificationSnapshot
 from backend.app.classification.store import ClassificationReadSnapshot, ClassificationStore
 from backend.app.market.baostock import INDEX_SYMBOLS, ProviderBatch
@@ -3346,16 +3346,27 @@ async def run_automation_loop(
     clock,
     poll_seconds: float = 60,
     replication_drain=None,
+    blocking_runner=run_blocking_operation,
 ) -> None:
     """Re-check regularly so process start and wake both perform catch-up."""
     while not stop.is_set():
         try:
-            await run_blocking_drained(service.run_due_once, clock())
+            scheduled_at = clock()
+            await blocking_runner(
+                BlockingOperation.MARKET_REFRESH,
+                service.run_due_once,
+                scheduled_at,
+                scheduled_at=scheduled_at,
+            )
             if replication_drain is not None:
                 # One bounded claim at most, after the refresh slot. Drain
                 # failures are observational and cannot alter canonical
                 # refresh success.
-                await run_blocking_drained(replication_drain.run_once)
+                await blocking_runner(
+                    BlockingOperation.REPLICATION_DRAIN,
+                    replication_drain.run_once,
+                    scheduled_at=scheduled_at,
+                )
         except Exception:
             _log_event(
                 logging.ERROR,
